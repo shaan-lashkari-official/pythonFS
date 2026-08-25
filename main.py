@@ -15,21 +15,32 @@ Controls:
     Q / E           rudder left / right
     Left Shift/Ctrl throttle up / down
     T               speedbrake toggle (full deploy / stow)
-    R  (hold)       reverse thrust (only works on ground)
+    R               toggle full reverse thrust (only works on ground)
     Space  (hold)   wheel brakes
-    P               parking brake toggle
+    O               parking brake toggle
+    P               open setup menu / resume flight
     G               gear toggle
     F / V           flaps down / up notch
     Home            reset to threshold
     F1 / F2         camera: chase / cockpit
+    C               toggle chase / cockpit camera
     Esc             quit
 """
 
 import math
 import sys
+from night_lighting import (
+    create_dynamic_night_lights, update_dynamic_night_lights,
+    set_night_mode, apply_night_fog, apply_day_fog,
+)
 
+from shadow import create_aircraft_shadow, update_aircraft_shadow
 from direct.showbase.ShowBase import ShowBase
 from direct.task import Task
+from direct.gui.DirectGui import (
+    DirectFrame, DirectButton, DirectLabel, DirectOptionMenu, DirectSlider,
+)
+from direct.gui.OnscreenText import OnscreenText
 from panda3d.core import (
     Vec3, Point3, WindowProperties, ClockObject, AntialiasAttrib,
     Fog, loadPrcFileData,
@@ -46,11 +57,13 @@ loadPrcFileData('', 'multisamples 4')
 from flight_dynamics import FlightDynamics, RUNWAY_HDG_DEG
 from plane_model import build_a320
 from scenery import (
-    build_ground, build_runway, build_runway_lights, build_city,
+    build_ground, build_runway, build_runway_lights,
+    build_heathrow_parallel_runway, build_city, build_city_lights,
     add_lighting, update_papi,
 )
 from hud import HUD
 from minimap import Minimap
+from audio import AudioSystem
 
 
 PHYSICS_HZ = 120
@@ -71,13 +84,50 @@ class Sim(ShowBase):
 
         self.disableMouse()   # we drive the camera manually
 
+        self.loading_panel = DirectFrame(
+            frameColor=(0.025, 0.05, 0.07, 1),
+            frameSize=(-2, 2, -1.15, 1.15),
+        )
+        self.loading_panel.setBin('fixed', 100)
+        self.loading_title = OnscreenText(
+            text='A320 FLIGHT SIM', pos=(0, 0.18), scale=0.09,
+            fg=(0.85, 0.95, 1, 1), align=2, mayChange=False,
+        )
+        self.loading_title.setBin('fixed', 101)
+        self.loading_status = OnscreenText(
+            text='Preparing Heathrow scenery...', pos=(0, -0.02), scale=0.045,
+            fg=(0.55, 0.85, 0.65, 1), align=2, mayChange=True,
+        )
+        self.loading_status.setBin('fixed', 101)
+        self.loading_bar = DirectFrame(
+            frameColor=(0.25, 0.75, 0.45, 1),
+            frameSize=(-0.65, 0.65, -0.018, 0.018),
+            pos=(0, 0, -0.20),
+        )
+        self.loading_bar.setBin('fixed', 101)
+        self._loading_update('Building terrain...', 0.12)
+
         # --- Scene
         build_ground().reparentTo(self.render)
+        self._loading_update('Laying out runways and taxiways...', 0.28)
         build_runway().reparentTo(self.render)
+        build_heathrow_parallel_runway().reparentTo(self.render)
         build_runway_lights().reparentTo(self.render)
+        build_runway_lights(
+            length=3650.0, center_y=1800.0,
+            name='northern_runway_lights', prefix='north_',
+        ).reparentTo(self.render)
+        self._loading_update('Generating Heathrow airport districts...', 0.52)
         build_city().reparentTo(self.render)
-        add_lighting(self.render)
+        self.night_pool = create_dynamic_night_lights(self.render, count=6)
+        self.city_lights = build_city_lights()
+        self.city_lights.reparentTo(self.render)
+        self._loading_update('Adding aircraft systems and instruments...', 0.72)
+        self.amb_np, self.sun_np = add_lighting(self.render)
+        self._loading_update('Preparing flight audio...', 0.84)
+        self.audio = AudioSystem(self.loader)
 
+        self.shadow = create_aircraft_shadow(self.render)
         # --- Aircraft
         self.plane = build_a320()
         self.plane.reparentTo(self.render)
@@ -85,7 +135,8 @@ class Sim(ShowBase):
         # Find animatable nodes once (avoid find() every frame)
         self.n_aileron_l = self.plane.find('**/aileron_left')
         self.n_aileron_r = self.plane.find('**/aileron_right')
-        self.n_elevator  = self.plane.find('**/elevator')
+        self.n_elevator_l = self.plane.find('**/elevator_left')
+        self.n_elevator_r = self.plane.find('**/elevator_right')
         self.n_rudder    = self.plane.find('**/rudder')
         self.n_flap_l    = self.plane.find('**/flap_left')
         self.n_flap_r    = self.plane.find('**/flap_right')
@@ -101,6 +152,7 @@ class Sim(ShowBase):
 
         # --- Physics
         self.fd = FlightDynamics(dt=PHYSICS_DT)
+        self.sim_started = False
 
         # --- HUD
         self.hud = HUD()
@@ -116,8 +168,8 @@ class Sim(ShowBase):
 
         self.keys = {}
         for k in ('w', 's', 'a', 'd', 'q', 'e', 'shift', 'control', 'space',
-                  'p', 'g', 'f', 'v', 't', 'r', 'm', 'home',
-                  'escape', 'f1', 'f2'):
+                  'o', 'p', 'g', 'f', 'v', 't', 'r', 'm', 'home',
+                  'escape', 'f1', 'f2', 'c'):
             self.accept(k,        self._key_down, [k])
             self.accept(k + '-up', self._key_up,   [k])
         # Panda3D emits 'lshift' / 'lcontrol' by default — map both
@@ -127,6 +179,13 @@ class Sim(ShowBase):
 
         self.camera_mode = 'chase'    # 'chase' or 'cockpit'
         self.physics_accum = 0.0
+        self.camera_motion = Vec3(0, 0, 0)
+        self.camera_motion_hpr = Vec3(0, 0, 0)
+        self.touchdown_kick = 0.0
+        self.crash_kick = 0.0
+        self.suspension_offset = 0.0
+        self.was_on_ground = self.fd.on_ground()
+        self.impact_latched = False
 
         # Fixed-timestep physics decoupled from render
         self.taskMgr.add(self._update, 'update')
@@ -135,16 +194,181 @@ class Sim(ShowBase):
         for _ in range(30):
             self.fd.step()
 
+        self._loading_update('Ready for departure', 1.0)
+        self.loading_panel.destroy()
+        self.loading_title.destroy()
+        self.loading_status.destroy()
+        self.loading_bar.destroy()
+        self._build_setup_screen()
+
+    def _loading_update(self, message, progress):
+        self.loading_status.setText(message)
+        self.loading_bar['frameSize'] = (-0.65, 1.3 * progress - 0.65,
+                                         -0.018, 0.018)
+        self.graphicsEngine.renderFrame()
+
+    def _build_setup_screen(self):
+        self.setup_root = self.aspect2d.attachNewNode('flight_setup')
+        self.setup_panel = DirectFrame(
+            parent=self.setup_root, frameColor=(0.025, 0.05, 0.07, 0.96),
+            frameSize=(-1.55, 1.55, -0.92, 0.92), pos=(0, 0, 0),
+        )
+        DirectLabel(parent=self.setup_root, text='FLIGHT SETUP',
+                    scale=0.075, pos=(0, 0, 0.74),
+                    text_fg=(0.85, 0.95, 1, 1), frameColor=(0, 0, 0, 0))
+        DirectLabel(parent=self.setup_root,
+                    text='EGLL HEATHROW  |  A320  |  MANUAL FLIGHT',
+                    scale=0.027, pos=(0, 0, 0.64),
+                    text_fg=(0.45, 0.78, 0.65, 1), frameColor=(0, 0, 0, 0))
+
+        self.setup_values = {}
+        self.spawn_menu = DirectOptionMenu(
+            parent=self.setup_root, items=[
+                'RUNWAY 27L', 'RUNWAY 27R', 'APPROACH 27L', 'APPROACH 27R'
+            ], initialitem=0, scale=0.045, pos=(-1.18, 0, 0.43),
+            frameColor=(0.10, 0.18, 0.20, 1),
+            text_fg=(0.85, 0.95, 1, 1),
+        )
+        self._setup_label('SPAWN LOCATION', -1.18, 0.54)
+        self._setup_label('WEATHER AND LIGHT', 0.28, 0.54)
+        self._add_slider('TIME', 0.0, 24.0, 14.0, 0.28, 0.42, '{:04.1f} h')
+        self._add_slider('WIND SPEED', 0.0, 40.0, 8.0, 0.28, 0.20, '{:02.0f} kt')
+        self._add_slider('WIND DIRECTION', 0.0, 360.0, 270.0, 0.28, -0.02, '{:03.0f} deg')
+        self._add_slider('GUSTS', 0.0, 30.0, 5.0, 0.28, -0.24, '{:02.0f} kt')
+        self._add_slider('TURBULENCE', 0.0, 10.0, 1.0, 0.28, -0.46, '{:02.1f}')
+        self._add_slider('THERMALS', 0.0, 10.0, 0.0, 0.28, -0.68, '{:02.1f}')
+
+        self._setup_label('GRAPHICS', -1.18, 0.22)
+        self.graphics_menu = DirectOptionMenu(
+            parent=self.setup_root, items=['ENHANCED', 'PERFORMANCE'],
+            initialitem=0, scale=0.045, pos=(-1.18, 0, 0.10),
+            frameColor=(0.10, 0.18, 0.20, 1),
+            text_fg=(0.85, 0.95, 1, 1),
+        )
+        self._setup_label('CAMERA', -1.18, -0.06)
+        self.camera_menu = DirectOptionMenu(
+            parent=self.setup_root, items=['CHASE', 'COCKPIT'], initialitem=0,
+            scale=0.045, pos=(-1.18, 0, -0.18),
+            frameColor=(0.10, 0.18, 0.20, 1),
+            text_fg=(0.85, 0.95, 1, 1),
+        )
+        self._setup_label('FLIGHT ASSIST', -1.18, -0.34)
+        DirectLabel(parent=self.setup_root,
+                    text='Mouse yoke enabled after launch', scale=0.030,
+                    pos=(-1.18, 0, -0.44), text_fg=(0.62, 0.72, 0.72, 1),
+                    frameColor=(0, 0, 0, 0), text_align=0)
+        is_resume = self.sim_started
+        DirectButton(parent=self.setup_root,
+                 text='RESUME FLIGHT' if is_resume else 'START FLIGHT',
+                 scale=0.055,
+                     pos=(-0.32, 0, -0.70),
+                     frameColor=(0.18, 0.62, 0.38, 1),
+                     text_fg=(1, 1, 1, 1), relief=1,
+                 command=(self._resume_flight if is_resume
+                      else self._start_configured_flight))
+
+    def _setup_label(self, text, x, z):
+        DirectLabel(parent=self.setup_root, text=text, scale=0.030,
+                    pos=(x, 0, z), text_fg=(0.55, 0.85, 0.65, 1),
+                    frameColor=(0, 0, 0, 0), text_align=0)
+
+    def _add_slider(self, name, minimum, maximum, value, x, z, fmt):
+        self._setup_label(name, x, z + 0.055)
+        value_label = DirectLabel(parent=self.setup_root, text=fmt.format(value),
+                                  scale=0.030, pos=(1.35, 0, z + 0.055),
+                                  text_fg=(0.85, 0.95, 1, 1),
+                                  frameColor=(0, 0, 0, 0), text_align=2)
+        slider = DirectSlider(parent=self.setup_root, range=(minimum, maximum),
+                              value=value, pageSize=(maximum - minimum) / 10,
+                              scale=0.46, pos=(0.78, 0, z),
+                              frameColor=(0.08, 0.13, 0.15, 1),
+                              thumb_frameColor=(0.25, 0.75, 0.45, 1),
+                              command=self._setup_slider_changed)
+        self.setup_values[name] = (slider, value_label, fmt)
+
+    def _setup_slider_changed(self):
+        for slider, label, fmt in self.setup_values.values():
+            label['text'] = fmt.format(slider.getValue())
+
+    def _start_configured_flight(self):
+        spawn_names = ['runway_27L', 'runway_27R', 'approach_27L', 'approach_27R']
+        weather = {
+            key.lower().replace(' ', '_'): slider.getValue()
+            for key, (slider, _, _) in self.setup_values.items()
+        }
+        spawn_names = {
+            'RUNWAY 27L': 'runway_27L',
+            'RUNWAY 27R': 'runway_27R',
+            'APPROACH 27L': 'approach_27L',
+            'APPROACH 27R': 'approach_27R',
+        }
+        self.fd = FlightDynamics(dt=PHYSICS_DT,
+                                 spawn=spawn_names[self.spawn_menu.get()],
+                                 weather=weather)
+        self.current_spawn = spawn_names[self.spawn_menu.get()]
+        self.current_weather = weather.copy()
+        self._apply_time_of_day(weather['time'])
+        self.camera_mode = 'cockpit' if self.camera_menu.get() == 'COCKPIT' else 'chase'
+        if self.graphics_menu.get() == 'PERFORMANCE':
+            self.render.clearAntialias()
+            self.render.getFog().setLinearRange(1200, 18000)
+        else:
+            self.render.setAntialias(AntialiasAttrib.MMultisample)
+            self.render.getFog().setLinearRange(2000, 25000)
+        self.sim_started = True
+        self.physics_accum = 0.0
+        self.setup_root.removeNode()
+
+    def _resume_flight(self):
+        """Close the setup overlay and continue the current flight."""
+        self.setup_root.removeNode()
+        self.sim_started = True
+
+    def _apply_time_of_day(self, hour):
+        """Set sky, lighting, and golden-hour warmth from the selected hour."""
+        daylight = max(0.0, math.sin((hour - 6.0) / 12.0 * math.pi))
+        dawn = max(0.0, 1.0 - abs(hour - 6.5) / 1.7)
+        dusk = max(0.0, 1.0 - abs(hour - 17.5) / 1.7)
+        golden_hour = max(dawn, dusk) * daylight
+        if daylight < 0.08:
+            sky = (0.015, 0.025, 0.07)
+            fog_color = (0.025, 0.045, 0.10)
+            set_night_mode(self.render, enabled=True, pool=self.night_pool,sun_light_np=self.sun_np, ambient_light_np=self.amb_np)
+            apply_night_fog(self.render)
+        else:
+            sky = (0.24 + daylight * 0.30 + golden_hour * 0.22,
+                   0.38 + daylight * 0.30 - golden_hour * 0.10,
+                   0.50 + daylight * 0.32 - golden_hour * 0.18)
+            fog_color = sky
+            set_night_mode(self.render, enabled=False, pool=self.night_pool,sun_light_np=self.sun_np, ambient_light_np=self.amb_np)
+            apply_day_fog(self.render)
+        self.setBackgroundColor(*sky)
+        self.render.getFog().setColor(*fog_color)
+        self.amb_np.node().setColor(
+            (0.08 + daylight * 0.32, 0.10 + daylight * 0.32,
+             0.16 + daylight * 0.30, 1)
+        )
+        self.sun_np.node().setColor(
+            (0.12 + daylight * 0.83,
+             0.16 + daylight * 0.72 - golden_hour * 0.20,
+             0.25 + daylight * 0.55 - golden_hour * 0.35, 1)
+        )
+
     # ------------------------------------------------------------------
     def _key_down(self, k):
+        was_down = self.keys.get(k, False)
         self.keys[k] = True
         # Discrete toggles fired on keydown
         if k == 'escape':
             sys.exit(0)
         elif k == 'g':
             self.fd.gear_down = not self.fd.gear_down
-        elif k == 'p':
+        elif k == 'o':
             self.fd.parking_brake = not self.fd.parking_brake
+        elif k == 'p':
+            if self.sim_started:
+                self.sim_started = False
+                self._build_setup_screen()
         elif k == 'f':
             self.fd.flap_setting = min(4, self.fd.flap_setting + 1)
         elif k == 'v':
@@ -160,15 +384,31 @@ class Sim(ShowBase):
             self.camera_mode = 'chase'
         elif k == 'f2':
             self.camera_mode = 'cockpit'
+        elif k == 'c':
+            self.camera_mode = (
+                'cockpit' if self.camera_mode == 'chase' else 'chase'
+            )
+        elif k == 'r' and not was_down:
+            self.fd.reverser = not self.fd.reverser
 
     def _key_up(self, k):
         self.keys[k] = False
 
     def _reset(self):
-        """Rebuild flight dynamics fresh at threshold."""
-        self.fd = FlightDynamics(dt=PHYSICS_DT)
+        """Rebuild flight dynamics using the current setup preset."""
+        self.fd = FlightDynamics(
+            dt=PHYSICS_DT,
+            spawn=getattr(self, 'current_spawn', 'runway_27L'),
+            weather=getattr(self, 'current_weather', {}),
+        )
         for _ in range(30):
             self.fd.step()
+        self.touchdown_kick = 0.0
+        self.crash_kick = 0.0
+        self.suspension_offset = 0.0
+        self.was_on_ground = self.fd.on_ground()
+        self.impact_latched = False
+        self.audio.reset_callouts()
 
     # ------------------------------------------------------------------
     def _read_mouse_yoke(self):
@@ -246,9 +486,6 @@ class Sim(ShowBase):
         # Wheel brakes (hold SPACE)
         self.fd.wheel_brake = 1.0 if k.get('space') else 0.0
 
-        # Reverse thrust (hold R) — only effective on ground
-        self.fd.reverser = bool(k.get('r'))
-
         # Auto-center only when there's genuinely no input from either
         # source (mouse-driven axes settle to the mouse position, they
         # don't need extra centering).
@@ -264,7 +501,7 @@ class Sim(ShowBase):
         """Copy JSBSim state → Panda3D aircraft NodePath."""
         east, north, up = self.fd.local_position_enu()
         # Our runway world uses +X east, +Y north. Threshold is at origin.
-        self.plane.setPos(east, north, up)
+        self.plane.setPos(east, north, up + self.suspension_offset)
 
         pitch_deg, roll_deg, hdg_deg = self.fd.attitude_deg()
         # Panda3D HPR: H = heading (0 = -Y, CCW). JSBSim psi = 0 (N), CW.
@@ -283,17 +520,18 @@ class Sim(ShowBase):
         if not self.n_aileron_r.isEmpty():
             self.n_aileron_r.setR(-self.fd.aileron * 20)
         # Elevator: single node
-        if not self.n_elevator.isEmpty():
-            self.n_elevator.setP(self.fd.elevator * 15)
+        for n in (self.n_elevator_l, self.n_elevator_r):
+            if not n.isEmpty():
+                n.setP(self.fd.elevator * 15)
         # Rudder
         if not self.n_rudder.isEmpty():
-            self.n_rudder.setH(self.fd.rudder * 25)
+            self.n_rudder.setH(-self.fd.rudder * 25)
         # Flaps: droop down with setting
         flap_deg = self.fd.flap_setting * 8   # 0..32°
         if not self.n_flap_l.isEmpty():
-            self.n_flap_l.setP(-flap_deg)
+            self.n_flap_l.setP(flap_deg)
         if not self.n_flap_r.isEmpty():
-            self.n_flap_r.setP(-flap_deg)
+            self.n_flap_r.setP(flap_deg)
 
         # Spoilers: pitch upward with speedbrake command (0..50°)
         sp_deg = self.fd.speedbrake * 50.0
@@ -310,44 +548,122 @@ class Sim(ShowBase):
                 n.show()
             else:
                 n.hide()
+        if not self.n_gear_nose.isEmpty():
+            self.n_gear_nose.setH(
+                -self.fd.rudder * 25 if self.fd.on_ground() else 0
+            )
 
     def _update_camera(self):
+        forward_g, lateral_g, vertical_g = self.fd.body_acceleration_g()
+        vertical_g -= 1.0
+
+        def clamp(value, limit):
+            return max(-limit, min(limit, value))
+
+        # A low-pass filter keeps turbulence and physics-step noise subtle.
+        crash = self.crash_kick
+        impact = self.touchdown_kick + crash
+        target_motion = Vec3(
+            clamp(-lateral_g * 0.24, 0.24),
+            clamp(-forward_g * 0.26, 0.26),
+            clamp(-vertical_g * 0.20, 0.20),
+        )
+        target_motion.y += impact * 0.42
+        target_motion.z -= impact * 0.38
+        target_hpr = Vec3(
+            clamp(-lateral_g * 3.0, 3.0),
+            clamp(forward_g * 3.2, 3.2),
+            clamp(-lateral_g * 2.1, 2.1),
+        )
+        target_hpr.y -= impact * 7.0
+        blend = min(1.0, ClockObject.getGlobalClock().getDt() * 8.0)
+        self.camera_motion += (target_motion - self.camera_motion) * blend
+        self.camera_motion_hpr += (target_hpr - self.camera_motion_hpr) * blend
+
         if self.camera_mode == 'chase':
             # 40m behind and 10m above the aircraft, looking at it
             offset = self.plane.getQuat().xform(Vec3(0, -50, 12))
-            cam_pos = self.plane.getPos() + offset
+            motion = self.plane.getQuat().xform(self.camera_motion)
+            cam_pos = self.plane.getPos() + offset + motion
             self.camera.setPos(cam_pos)
             self.camera.lookAt(self.plane, Point3(0, 0, 3))
+            self.camera.setHpr(self.camera.getHpr() + self.camera_motion_hpr)
         else:  # cockpit-ish: at nose, looking forward with plane
             fwd_offset = self.plane.getQuat().xform(Vec3(0, 16.5, 2.5))
-            self.camera.setPos(self.plane.getPos() + fwd_offset)
-            self.camera.setHpr(self.plane.getHpr())
+            motion = self.plane.getQuat().xform(self.camera_motion)
+            self.camera.setPos(self.plane.getPos() + fwd_offset + motion)
+            self.camera.setHpr(self.plane.getHpr() + self.camera_motion_hpr)
             # Nudge pitch down a touch so horizon sits naturally
             self.camera.setP(self.camera.getP() - 3)
 
     # ------------------------------------------------------------------
     def _update(self, task):
+        if not self.sim_started:
+            return Task.cont
         dt = ClockObject.getGlobalClock().getDt()
         # Cap dt to avoid physics blowup on hitches
         dt = min(dt, 0.1)
-
+        
         self._apply_inputs(dt)
+        self.touchdown_kick *= max(0.0, 1.0 - dt * 4.5)
+        self.crash_kick *= max(0.0, 1.0 - dt * 2.8)
+        suspension_target = -self.touchdown_kick * 0.16
+        suspension_target -= self.crash_kick * 0.42
+        self.suspension_offset += (
+            suspension_target - self.suspension_offset
+        ) * min(1.0, dt * 14.0)
 
         # Fixed-step physics
         self.physics_accum += dt
         steps = 0
         while self.physics_accum >= PHYSICS_DT and steps < 20:
+            was_on_ground = self.fd.on_ground()
+            descent_speed_fps = abs(float(
+                self.fd.fdm['velocities/v-down-fps']
+            ))
             self.fd.step()
+            now_on_ground = self.fd.on_ground()
+            near_ground_impact = (
+                self.fd.gear_down and self.fd.agl_ft() < 25.0 and
+                descent_speed_fps > 12.0
+            )
+            belly_contact = (
+                not self.fd.gear_down and self.fd.agl_ft() <= 5.0 and
+                self.fd.ground_speed_kt() > 8.0
+            )
+            if self.fd.agl_ft() > 40.0 and not now_on_ground:
+                self.impact_latched = False
+            impact_event = (
+                not self.impact_latched and
+                ((not was_on_ground and now_on_ground) or
+                 near_ground_impact or belly_contact)
+            )
+            if impact_event:
+                impact = min(2.5, max(0.0, descent_speed_fps / 8.0))
+                if self.fd.gear_down:
+                    self.touchdown_kick = max(self.touchdown_kick, impact)
+                else:
+                    self.crash_kick = max(self.crash_kick, impact)
+                    self.fd.begin_belly_contact()
+                self.audio.touchdown(impact)
+                self.impact_latched = True
+            self.was_on_ground = now_on_ground
             self.physics_accum -= PHYSICS_DT
             steps += 1
 
         self._sync_plane_to_physics()
         self._animate_surfaces()
         self._update_camera()
+        self.audio.update(self.fd)
+        update_dynamic_night_lights(self.night_pool, self.plane.getPos())
+
+
 
         # PAPI needs aircraft east + altitude in world coords
         pos = self.plane.getPos()
         update_papi(self.render, pos.x, pos.z)
+        update_papi(self.render, pos.x, pos.z, center_y=1800.0,
+                prefix='north_')
 
         self.hud.update(
             self.fd,
@@ -358,7 +674,12 @@ class Sim(ShowBase):
         )
         # Minimap: aircraft east/north come from local ENU already computed
         east, north, _ = self.fd.local_position_enu()
+
+        east, north, up = self.fd.local_position_enu()
+        update_aircraft_shadow(self.shadow, east, north, up, self.fd.heading_deg())
         self.minimap.update(east, north, self.fd.heading_deg())
+
+
         return Task.cont
 
 

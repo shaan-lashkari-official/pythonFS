@@ -64,8 +64,8 @@ def _make_box_geom(sx, sy, sz, color=(1, 1, 1, 1)):
 
 
 def _make_cylinder_geom(radius, length, segments=16, color=(1, 1, 1, 1),
-                        axis='x'):
-    """Cylinder centered on origin, extending along `axis` ('x','y','z')."""
+                        axis='x', radius_end=None):
+    """Cylinder or tapered cylinder centered on origin."""
     fmt = GeomVertexFormat.getV3n3c4()
     vdata = GeomVertexData('cyl', fmt, Geom.UHStatic)
     vwr = GeomVertexWriter(vdata, 'vertex')
@@ -100,10 +100,11 @@ def _make_cylinder_geom(radius, length, segments=16, color=(1, 1, 1, 1),
         n0 = (math.cos(a0), math.sin(a0))
         n1 = (math.cos(a1), math.sin(a1))
 
+        end_radius = radius if radius_end is None else radius_end
         v = [
             (pos(-hl, x0, y0), norm(*n0)),
-            (pos( hl, x0, y0), norm(*n0)),
-            (pos( hl, x1, y1), norm(*n1)),
+            (pos( hl, x0 * end_radius / radius, y0 * end_radius / radius), norm(*n0)),
+            (pos( hl, x1 * end_radius / radius, y1 * end_radius / radius), norm(*n1)),
             (pos(-hl, x1, y1), norm(*n1)),
         ]
         for p, n in v:
@@ -124,7 +125,10 @@ def _make_cylinder_geom(radius, length, segments=16, color=(1, 1, 1, 1),
         ring_start = idx
         for i in range(segments):
             a = 2 * math.pi * i / segments
-            x, y = math.cos(a) * radius, math.sin(a) * radius
+            cap_radius = radius if cap_norm < 0 else (
+                radius if radius_end is None else radius_end
+            )
+            x, y = math.cos(a) * cap_radius, math.sin(a) * cap_radius
             vwr.addData3(*pos(cap_pos, x, y))
             # normal points along the axis
             if axis == 'x':   nwr.addData3(cap_norm, 0, 0)
@@ -164,27 +168,26 @@ def build_a320():
     Named sub-nodes for animation:
       .find('**/gear_nose'), .find('**/gear_left'), .find('**/gear_right')
       .find('**/aileron_left'), .find('**/aileron_right')
-      .find('**/elevator'), .find('**/rudder'), .find('**/flap_left'),
-      .find('**/flap_right')
+    .find('**/elevator_left'), .find('**/elevator_right'),
+    .find('**/rudder'), .find('**/flap_left'), .find('**/flap_right')
     """
     plane = NodePath('a320')
 
-    # --- Fuselage: cylinder along Y (forward axis)
-    fuselage = _make_cylinder_geom(2.0, 37.6, segments=20,
+    # --- Fuselage: rounded center section with tapered nose and tail
+    fuselage = _make_cylinder_geom(2.0, 27.6, segments=20,
                                    color=FUSELAGE_COLOR, axis='y')
     fuselage.reparentTo(plane)
 
-    # Nose cone: smaller cylinder tapered by scaling
-    nose = _make_cylinder_geom(1.6, 3.0, segments=16,
-                               color=FUSELAGE_COLOR, axis='y')
-    nose.setY(37.6 / 2 + 1.5)
-    nose.setSy(1.5)   # elongate a bit
+    nose = _make_cylinder_geom(1.9, 5.0, segments=20,
+                               color=FUSELAGE_COLOR, axis='y',
+                               radius_end=0.25)
+    nose.setY(16.3)
     nose.reparentTo(plane)
 
-    # Tail cone
-    tailcone = _make_cylinder_geom(1.4, 3.0, segments=16,
-                                   color=FUSELAGE_COLOR, axis='y')
-    tailcone.setY(-37.6 / 2 - 1.5)
+    tailcone = _make_cylinder_geom(0.75, 5.0, segments=20,
+                                   color=FUSELAGE_COLOR, axis='y',
+                                   radius_end=1.9)
+    tailcone.setY(-16.3)
     tailcone.reparentTo(plane)
 
     # --- Main wings: use two swept boxes (one per side).
@@ -206,8 +209,8 @@ def build_a320():
         # Aileron: small box near wingtip, on trailing edge
         aileron = _make_box_geom(3.0, 0.8, 0.15, color=CONTROL_COLOR)
         aileron.setName(f'aileron_{"right" if side_sign > 0 else "left"}')
-        aileron.setX(side_sign * (2.0 + 13.0))
-        aileron.setY(-3.0)
+        aileron.setX(side_sign * (2.0 + 12.5))
+        aileron.setY(-1.0 - 5.0 * math.sin(math.radians(25)))
         aileron.setZ(-0.9)
         aileron.setH(side_sign * -25)
         aileron.reparentTo(wing_root)
@@ -240,6 +243,28 @@ def build_a320():
         engine.setY(1.0)
         engine.setZ(-2.5)
         engine.reparentTo(wing_root)
+
+        # Dark intake and exhaust faces make the CFM56 nacelles readable.
+        intake = _make_cylinder_geom(1.12, 0.12, segments=20,
+                         color=(0.06, 0.07, 0.09, 1), axis='y')
+        intake.setX(side_sign * 6.0)
+        intake.setY(3.28)
+        intake.setZ(-2.5)
+        intake.reparentTo(wing_root)
+        exhaust = _make_cylinder_geom(0.78, 0.12, segments=16,
+                          color=(0.12, 0.12, 0.14, 1), axis='y')
+        exhaust.setX(side_sign * 6.0)
+        exhaust.setY(-1.28)
+        exhaust.setZ(-2.5)
+        exhaust.reparentTo(wing_root)
+
+        # Blended winglet, a distinctive A320 family silhouette.
+        winglet = _make_box_geom(0.18, 1.8, 2.2, color=WING_COLOR)
+        winglet.setX(side_sign * 17.35)
+        winglet.setY(-1.0 - 7.5 * math.sin(math.radians(25)))
+        winglet.setZ(0.1)
+        winglet.setH(side_sign * -25)
+        winglet.reparentTo(wing_root)
 
         # Pylon connecting engine to wing
         pylon = _make_box_geom(0.4, 2.0, 1.5, color=WING_COLOR)
@@ -281,38 +306,56 @@ def build_a320():
     hstab_right.setH(15)
     hstab_right.reparentTo(plane)
 
-    # Elevator (both sides as one node for simplicity)
-    elevator = _make_box_geom(12.0, 0.8, 0.2, color=CONTROL_COLOR)
-    elevator.setName('elevator')
-    elevator.setY(-17.5)
-    elevator.setZ(1.5)
-    elevator.reparentTo(plane)
+    # Separate left and right elevators, each aligned with its stabilizer.
+    for side_sign in (-1, 1):
+        elevator = _make_box_geom(5.5, 0.8, 0.2, color=CONTROL_COLOR)
+        elevator.setName(f'elevator_{"right" if side_sign > 0 else "left"}')
+        elevator.setX(side_sign * 3.5)
+        elevator.setY(-17.5)
+        elevator.setZ(1.5)
+        elevator.setH(side_sign * 15)
+        elevator.reparentTo(plane)
 
     # --- Landing gear
-    def build_gear(name, x, y, z, leg_len=2.5):
+    def build_gear(name, x, y, z, leg_len=2.5, main=False):
         gear = NodePath(name)
         leg = _make_cylinder_geom(0.15, leg_len, segments=8,
                                   color=GEAR_COLOR, axis='z')
         leg.setZ(-leg_len / 2)
         leg.reparentTo(gear)
-        wheel = _make_cylinder_geom(0.5, 0.4, segments=12,
-                                    color=(0.1, 0.1, 0.1, 1), axis='x')
-        wheel.setZ(-leg_len)
-        wheel.reparentTo(gear)
+
+        # A320 nose gear has two wheels; each main bogie has four wheels.
+        wheel_positions = (
+            ((-0.28, 0.0), (0.28, 0.0)) if not main else
+            ((-0.42, -0.58), (0.42, -0.58),
+             (-0.42, 0.58), (0.42, 0.58))
+        )
+        for wheel_x, wheel_y in wheel_positions:
+            wheel = _make_cylinder_geom(0.5, 0.28, segments=12,
+                                        color=(0.1, 0.1, 0.1, 1), axis='x')
+            wheel.setPos(wheel_x, wheel_y, -leg_len)
+            wheel.reparentTo(gear)
+
+        if main:
+            bogie = _make_box_geom(0.18, 1.7, 0.18, color=GEAR_COLOR)
+            bogie.setZ(-leg_len + 0.05)
+            bogie.reparentTo(gear)
         gear.setPos(x, y, z)
         return gear
 
     build_gear('gear_nose',  0.0,  14.0, -2.0).reparentTo(plane)
-    build_gear('gear_left', -3.5,  -1.0, -2.0).reparentTo(plane)
-    build_gear('gear_right', 3.5,  -1.0, -2.0).reparentTo(plane)
+    build_gear('gear_left', -3.5,  -1.0, -2.0, main=True).reparentTo(plane)
+    build_gear('gear_right', 3.5,  -1.0, -2.0, main=True).reparentTo(plane)
 
-    # Small cockpit windows hint (dark strip near nose)
-    windows = _make_box_geom(0.1, 3.0, 0.6, color=(0.05, 0.1, 0.2, 1))
-    windows.setY(16.0)
-    windows.setZ(0.8)
-    windows.setX(2.05)
-    windows.reparentTo(plane)
-    windows2 = windows.copyTo(plane)
-    windows2.setX(-2.05)
+    # Cockpit windshield panes, placed on both sides of the tapered nose.
+    window_color = (0.04, 0.10, 0.18, 1)
+    for side_sign in (-1, 1):
+        for y, z, length in ((14.7, 1.05, 1.0), (15.8, 1.2, 0.7)):
+            window = _make_box_geom(0.08, length, 0.55, color=window_color)
+            window.setX(side_sign * 1.78)
+            window.setY(y)
+            window.setZ(z)
+            window.setH(side_sign * -12)
+            window.reparentTo(plane)
 
     return plane

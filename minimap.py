@@ -21,9 +21,14 @@ FEATURES = [
     # Runway 27L: line from threshold (0,0) west to (-3902, 0)
     dict(type='line', a=(0, 0), b=(-3902, 0),
          color=(0.95, 0.95, 0.95, 1), width=2.5),
+    # Heathrow's parallel northern runway 27R.
+    dict(type='line', a=(0, 1800), b=(-3650, 1800),
+         color=(0.95, 0.95, 0.95, 1), width=2.5),
     # Parallel taxiway
     dict(type='line', a=(-100, 100), b=(-3900, 100),
          color=(0.85, 0.7, 0.15, 1), width=1.2),
+        dict(type='line', a=(-100, 1680), b=(-3800, 1680),
+            color=(0.85, 0.7, 0.15, 1), width=1.2),
     # River (X ≈ 6000, running north-south)
     dict(type='line', a=(6000, -8000), b=(6000, 8000),
          color=(0.30, 0.55, 0.85, 1), width=1.8),
@@ -47,6 +52,8 @@ FEATURES = [
          color=(0.7, 0.7, 0.8, 1)),
     dict(type='rect', center=(-2400, -400), sx=800, sy=100,
          color=(0.55, 0.55, 0.6, 1)),
+        dict(type='rect', center=(-1250, 950), sx=520, sy=110,
+            color=(0.35, 0.55, 0.65, 1)),
 ]
 
 
@@ -154,10 +161,10 @@ class Minimap:
 
         # Rotate aircraft marker to show heading. Panda2D 'R' rotates
         # around the axis pointing into the screen. Heading in world:
-        # 0 = north (up on map). Positive heading = turn right (CW seen
-        # from above), which in the top-down 2D view is CW = negative R
-        # in Panda's convention (which is CCW positive). So R = -heading.
-        self.aircraft_marker.setR(-heading_deg)
+        # The marker nose points toward +Z (north). Panda3D's positive R
+        # rotates that vector clockwise on this x/z overlay, matching a
+        # clockwise aviation heading.
+        self.aircraft_marker.setR(heading_deg)
 
     # ------------------------------------------------------------------
     def _draw_line(self, f, ae, an):

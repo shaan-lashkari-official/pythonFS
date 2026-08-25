@@ -21,7 +21,7 @@ small objects don't kill the frame rate.
 
 import math
 import random
-
+from night_lighting import build_night_lighting_group
 from panda3d.core import (
     Geom, GeomNode, GeomVertexData, GeomVertexFormat, GeomVertexWriter,
     GeomTriangles, NodePath, Vec3, Vec4, Point3, CardMaker,
@@ -61,13 +61,67 @@ def _cyl(radius, length, color, segments=10, axis='z'):
                                color=color, axis=axis)
 
 
+def _airport_clear(x, y, margin=0.0):
+    """Return False for the two runway corridors and their safety margins."""
+    return not (
+        -4300 - margin < x < 500 + margin and
+        -300 - margin < y < 2100 + margin
+    )
+
+
+def _terrain_mesh(size, divisions=48, seed=11):
+    """Low-relief terrain with a level airport basin around the runway."""
+    rng = random.Random(seed)
+    fmt = GeomVertexFormat.getV3n3c4()
+    vdata = GeomVertexData('terrain', fmt, Geom.UHStatic)
+    rows = divisions + 1
+    vdata.setNumRows(rows * rows)
+    vw = GeomVertexWriter(vdata, 'vertex')
+    nw = GeomVertexWriter(vdata, 'normal')
+    cw = GeomVertexWriter(vdata, 'color')
+    step = size / divisions
+    for row in range(rows):
+        y = -size / 2 + row * step
+        for col in range(rows):
+            x = -size / 2 + col * step
+            basin = max(0.0, 1.0 - math.hypot(x / 4200, y / 1500))
+            waves = (math.sin(x / 850) + math.cos(y / 1100)) * 1.6
+            broad = math.sin((x + y) / 2600) * 2.0
+            # Terrain is the base layer; keep every airport/road/water overlay
+            # above it to avoid z-fighting and accidental occlusion.
+            z = -0.35 + (waves + broad) * (1.0 - basin) * 0.08
+            z += rng.uniform(-0.02, 0.02)
+            # Keep the complete runway, taxiway, and approach corridor level.
+            if -4300 < x < 500 and -300 < y < 2100:
+                z = 0.0
+            z = max(-0.65, min(-0.12, z))
+            green = 0.25 + 0.06 * math.sin(x / 500) + 0.03 * math.cos(y / 700)
+            cw.addData4(0.12, max(0.20, green), 0.10, 1)
+            vw.addData3(x, y, z)
+            nw.addData3(0, 0, 1)
+    tris = GeomTriangles(Geom.UHStatic)
+    for row in range(divisions):
+        for col in range(divisions):
+            a = row * rows + col
+            b = a + 1
+            c = a + rows
+            d = c + 1
+            tris.addVertices(a, b, c)
+            tris.addVertices(b, d, c)
+    geom = Geom(vdata)
+    geom.addPrimitive(tris)
+    node = GeomNode('terrain')
+    node.addGeom(geom)
+    return NodePath(node)
+
+
 # ----------------------------------------------------------------------
 # Ground
 # ----------------------------------------------------------------------
 def build_ground(size=30000.0):
-    """Base ground: dark green everywhere."""
-    ground = _flat_quad(size, size, color=(0.18, 0.32, 0.14, 1))
-    ground.setZ(-0.05)
+    """Vibrant low-relief countryside surrounding a level airport basin."""
+    ground = _terrain_mesh(size)
+    ground.setZ(-0.08)
     return ground
 
 
@@ -78,7 +132,7 @@ def _grass_patches(parent, seed=1):
         x = rng.uniform(-12000, 12000)
         y = rng.uniform(-12000, 12000)
         # Skip anywhere near the runway (visual noise on the strip)
-        if -4200 < x < 200 and -400 < y < 400:
+        if not _airport_clear(x, y, margin=80):
             continue
         sx = rng.uniform(80, 400)
         sy = rng.uniform(80, 400)
@@ -89,6 +143,28 @@ def _grass_patches(parent, seed=1):
         patch = _flat_quad(sx, sy, color=(r, g, b, 1))
         patch.setPos(x, y, -0.03)     # just above the base ground
         patch.reparentTo(parent)
+
+
+def build_fields(seed=13):
+    """Large rectangular fields and hedgerows for a readable aerial map."""
+    rng = random.Random(seed)
+    fields = NodePath('fields')
+    field_colors = [
+        (0.24, 0.43, 0.16, 1), (0.31, 0.50, 0.18, 1),
+        (0.42, 0.50, 0.20, 1), (0.20, 0.38, 0.16, 1),
+    ]
+    for x in range(-12000, 12001, 1600):
+        for y in range(-10000, 10001, 1500):
+            if not _airport_clear(x, y, margin=80):
+                continue
+            field = _flat_quad(rng.uniform(850, 1020),
+                               rng.uniform(650, 900),
+                               color=rng.choice(field_colors))
+            field.setPos(x + rng.uniform(-90, 90),
+                         y + rng.uniform(-80, 80), 0.002)
+            field.reparentTo(fields)
+    fields.flattenStrong()
+    return fields
 
 
 # ----------------------------------------------------------------------
@@ -138,7 +214,7 @@ def build_runway(length=3902.0, width=45.0):
     designator.reparentTo(rwy)
 
     # --- Parallel taxiway 150m north of the runway
-    taxiway = _flat_quad(length + 400, 25, color=(0.14, 0.14, 0.15, 1))
+    taxiway = _flat_quad(length + 400, 32, color=(0.105, 0.105, 0.115, 1))
     taxiway.setPos(-length / 2, 100, 0.005)
     taxiway.reparentTo(rwy)
 
@@ -152,11 +228,62 @@ def build_runway(length=3902.0, width=45.0):
 
     # Connector taxiways: 5 short strips linking runway to taxiway
     for x_pos in (-200, -900, -1600, -2400, -3200):
-        connector = _flat_quad(25, 100, color=(0.14, 0.14, 0.15, 1))
+        connector = _flat_quad(32, 100, color=(0.105, 0.105, 0.115, 1))
         connector.setPos(x_pos, 50, 0.005)
         connector.reparentTo(rwy)
 
+    # Taxiway edge lines and a broad terminal apron make the airport read as active.
+    for side in (-1, 1):
+        edge = _flat_quad(length + 400, 0.35, color=(0.9, 0.9, 0.82, 1))
+        edge.setPos(-length / 2, 100 + side * 15.2, 0.02)
+        edge.reparentTo(rwy)
+    apron = _flat_quad(1500, 430, color=(0.18, 0.19, 0.20, 1))
+    apron.setPos(-1500, 430, 0.01)
+    apron.reparentTo(rwy)
+    for x in range(-2050, -900, 90):
+        stand = _flat_quad(55, 3, color=(0.82, 0.82, 0.76, 1))
+        stand.setPos(x, 350, 0.025)
+        stand.reparentTo(rwy)
+
     return rwy
+
+
+def build_heathrow_parallel_runway(length=3650.0, width=45.0,
+                                   center_y=1800.0):
+    """The northern 27R/09L runway and its characteristic parallel taxiway."""
+    airport = NodePath('heathrow_northern_runway')
+    runway = _flat_quad(length, width, color=(0.11, 0.115, 0.125, 1))
+    runway.setPos(-length / 2, center_y, 0.012)
+    runway.reparentTo(airport)
+
+    # Threshold and centerline markings, aligned with the active runway.
+    for i in range(8):
+        stripe = _flat_quad(6, 3, color=(1, 1, 1, 1))
+        stripe.setPos(-6, center_y - width / 2 + 4 + i * 5, 0.024)
+        stripe.reparentTo(airport)
+    for x in range(-35, int(-length + 60), -50):
+        dash = _flat_quad(30, 0.9, color=(1, 1, 1, 1))
+        dash.setPos(x - 15, center_y, 0.024)
+        dash.reparentTo(airport)
+    for side in (-1, 1):
+        edge = _flat_quad(length, 0.45, color=(0.9, 0.9, 0.84, 1))
+        edge.setPos(-length / 2, center_y + side * (width / 2 - 2), 0.024)
+        edge.reparentTo(airport)
+
+    taxiway = _flat_quad(length + 350, 30, color=(0.105, 0.11, 0.12, 1))
+    taxiway.setPos(-length / 2, center_y - 120, 0.018)
+    taxiway.reparentTo(airport)
+    for x in range(-50, int(-length - 150), -28):
+        dash = _flat_quad(15, 0.6, color=(0.95, 0.82, 0.15, 1))
+        dash.setPos(x, center_y - 120, 0.033)
+        dash.reparentTo(airport)
+
+    # High-speed connectors between runway and taxiway.
+    for x in (-300, -1000, -1750, -2500, -3250):
+        connector = _flat_quad(28, 120, color=(0.105, 0.11, 0.12, 1))
+        connector.setPos(x, center_y - 60, 0.016)
+        connector.reparentTo(airport)
+    return airport
 
 
 # ----------------------------------------------------------------------
@@ -176,12 +303,14 @@ def _light_point(color=(1, 1, 1, 1), size=1.5):
     return np
 
 
-def build_runway_lights(length=3902.0, width=45.0):
-    lights = NodePath('runway_lights')
+def build_runway_lights(length=3902.0, width=45.0, center_y=0.0,
+                        name='runway_lights', prefix=''):
+    """Build threshold, edge, PAPI, and approach lights for one runway."""
+    lights = NodePath(name)
 
     # Threshold — green
     for i in range(6):
-        y = -width / 2 + (i + 0.5) * (width / 6)
+        y = center_y - width / 2 + (i + 0.5) * (width / 6)
         l = _light_point((0.0, 1.0, 0.2, 1), size=1.2)
         l.setPos(0.5, y, 0.5); l.reparentTo(lights)
 
@@ -192,7 +321,7 @@ def build_runway_lights(length=3902.0, width=45.0):
         color = (1, 1, 0.4, 1) if x < -length + 600 else (1, 1, 1, 1)
         for side in (-1, 1):
             l = _light_point(color, size=1.0)
-            l.setPos(x, side * (width / 2 + 1), 0.5); l.reparentTo(lights)
+            l.setPos(x, center_y + side * (width / 2 + 1), 0.5); l.reparentTo(lights)
 
     # Centerline
     n_cl = int(length / 15)
@@ -206,44 +335,46 @@ def build_runway_lights(length=3902.0, width=45.0):
         else:
             color = (1, 1, 1, 1)
         l = _light_point(color, size=0.7)
-        l.setPos(x, 0, 0.4); l.reparentTo(lights)
+        l.setPos(x, center_y, 0.4); l.reparentTo(lights)
 
     # End lights — red
     for i in range(6):
-        y = -width / 2 + (i + 0.5) * (width / 6)
+        y = center_y - width / 2 + (i + 0.5) * (width / 6)
         l = _light_point((1, 0, 0, 1), size=1.2)
         l.setPos(-length, y, 0.5); l.reparentTo(lights)
 
     # PAPI
-    papi_parent = NodePath('papi')
+    papi_parent = NodePath(f'{prefix}papi')
     for i in range(4):
         l = _light_point((1, 1, 1, 1), size=1.6)
-        l.setName(f'papi_{i}')
-        l.setPos(-300, -width / 2 - 15 - i * 9, 1.5)
+        l.setName(f'{prefix}papi_{i}')
+        l.setPos(-300, center_y - width / 2 - 15 - i * 9, 1.5)
         l.reparentTo(papi_parent)
     papi_parent.reparentTo(lights)
 
     # Approach lighting centerline extension
     for i in range(1, 20):
         l = _light_point((1, 1, 1, 1), size=1.4)
-        l.setPos(i * 30.0, 0, 0.5); l.reparentTo(lights)
+        l.setPos(i * 30.0, center_y, 0.5); l.reparentTo(lights)
     # Crossbar
     for j in range(-4, 5):
         l = _light_point((1, 1, 1, 1), size=1.2)
-        l.setPos(300, j * 4, 0.5); l.reparentTo(lights)
+        l.setPos(300, center_y + j * 4, 0.5); l.reparentTo(lights)
 
     return lights
 
 
-def update_papi(scene_root, aircraft_east, aircraft_up):
+def update_papi(scene_root, aircraft_east, aircraft_up, center_y=0.0,
+                prefix=''):
     """4-bulb PAPI: red/white based on angle to touchdown zone."""
+    # PAPI is meaningful only when the aircraft is on the approach side.
     dx = aircraft_east - (-300.0)
     if dx <= 0:
         return
     angle_deg = math.degrees(math.atan2(max(aircraft_up, 0.1), dx))
     transitions = [2.5, 2.83, 3.17, 3.5]
     for i, t in enumerate(transitions):
-        node = scene_root.find(f'**/papi_{i}')
+        node = scene_root.find(f'**/{prefix}papi_{i}')
         if node.isEmpty():
             continue
         node.setColor(1, 1, 1, 1) if angle_deg > t else node.setColor(1, 0.15, 0.05, 1)
@@ -310,7 +441,7 @@ def build_trees(seed=7):
             x = cx + rr * math.cos(th)
             y = cy + rr * math.sin(th)
             # keep trees off the runway strip
-            if -4200 < x < 300 and -300 < y < 300:
+            if not _airport_clear(x, y, margin=120):
                 continue
             t = _make_tree(rng)
             t.setPos(x, y, 0)
@@ -321,7 +452,7 @@ def build_trees(seed=7):
     for _ in range(600):
         x = rng.uniform(-10000, 10000)
         y = rng.uniform(-10000, 10000)
-        if -4400 < x < 400 and -800 < y < 800:
+        if not _airport_clear(x, y, margin=180):
             continue     # keep clear of runway/taxiway area
         if abs(x) > 12000 or abs(y) > 12000:
             continue
@@ -347,41 +478,195 @@ def build_trees(seed=7):
 # Roads
 # ----------------------------------------------------------------------
 def build_roads():
-    """Simple grid + a couple of highways."""
+    """Highways and connected local streets around the airport."""
     roads = NodePath('roads')
-    road_col = (0.22, 0.22, 0.23, 1)
+    road_col = (0.10, 0.11, 0.12, 1)
     line_col = (0.9, 0.85, 0.3, 1)
 
-    # Two east-west "highways"
+    # Broad divided highways with a planted median.
     for y in (2500, -2000):
-        road = _flat_quad(24000, 14, color=road_col)
-        road.setPos(0, y, 0.005); road.reparentTo(roads)
-        # centerline dashes
-        for x in range(-11000, 11000, 40):
-            d = _flat_quad(15, 0.4, color=line_col)
-            d.setPos(x, y, 0.015); d.reparentTo(roads)
+        for lane_y in (y - 12, y + 12):
+            road = _flat_quad(24000, 10, color=road_col)
+            road.setPos(0, lane_y, 0.04); road.reparentTo(roads)
+            for x in range(-11000, 11000, 40):
+                d = _flat_quad(15, 0.35, color=line_col)
+                d.setPos(x, lane_y, 0.055); d.reparentTo(roads)
+        median = _flat_quad(24000, 5, color=(0.18, 0.34, 0.12, 1))
+        median.setPos(0, y, 0.045); median.reparentTo(roads)
 
-    # Two north-south roads
+    # Two main roads feeding the airport and the city.
     for x in (3500, -4500):
-        road = _flat_quad(14, 24000, color=road_col)
+        road = _flat_quad(11, 24000, color=road_col)
         road.setPos(x, 0, 0.005); road.reparentTo(roads)
         for y in range(-11000, 11000, 40):
             d = _flat_quad(0.4, 15, color=line_col)
             d.setPos(x, y, 0.015); d.reparentTo(roads)
 
-    # Grid within downtown cluster (5000, 4000)
-    for i in range(-3, 4):
-        # E-W streets
-        s = _flat_quad(2400, 8, color=road_col)
-        s.setPos(5000, 4000 + i * 200, 0.005)
-        s.reparentTo(roads)
-        # N-S streets
-        s = _flat_quad(8, 2400, color=road_col)
-        s.setPos(5000 + i * 200, 4000, 0.005)
-        s.reparentTo(roads)
+    # Downtown streets stay on the edges of blocks, leaving buildings on land.
+    for offset in (-1000, -500, 0, 500, 1000):
+        for y in (3000 + offset, 5000 + offset):
+            s = _flat_quad(2400, 8, color=road_col)
+            s.setPos(5000, y, 0.005)
+            s.reparentTo(roads)
+        for x in (4000 + offset, 6000 + offset):
+            s = _flat_quad(8, 2400, color=road_col)
+            s.setPos(x, 4000, 0.005)
+            s.reparentTo(roads)
 
     roads.flattenStrong()
     return roads
+
+
+def build_parks(seed=19):
+    """Green public spaces and paths breaking up the nearby neighborhoods."""
+    rng = random.Random(seed)
+    parks = NodePath('parks')
+    park_specs = [
+        (-3000, 2700, 950, 520),
+        (-650, 2700, 680, 430),
+        (1500, -1350, 1050, 520),
+        (3300, 1300, 720, 480),
+    ]
+    for cx, cy, sx, sy in park_specs:
+        grass = _flat_quad(sx, sy, color=(0.16, 0.42, 0.18, 1))
+        grass.setPos(cx, cy, 0.08)
+        grass.reparentTo(parks)
+        for offset in (-0.25, 0.25):
+            path = _flat_quad(sx * 0.9, 8, color=(0.65, 0.56, 0.38, 1))
+            path.setPos(cx, cy + sy * offset, 0.10)
+            path.reparentTo(parks)
+        for _ in range(16):
+            tree = _make_tree(rng)
+            tree.setScale(0.65)
+            tree.setPos(cx + rng.uniform(-sx * 0.42, sx * 0.42),
+                        cy + rng.uniform(-sy * 0.38, sy * 0.38), 0.12)
+            tree.reparentTo(parks)
+    parks.flattenStrong()
+    return parks
+
+
+def build_nearby_neighborhoods(seed=31):
+    """Compact apartments and houses that establish a lived-in airport edge."""
+    rng = random.Random(seed)
+    neighborhoods = NodePath('nearby_neighborhoods')
+    specs = [
+        (-3000, 2350, 7, 4, True),
+        (-700, 2450, 6, 4, True),
+        (1450, -2300, 7, 4, False),
+        (3200, 1800, 6, 4, False),
+    ]
+    for cx, cy, cols, rows, apartments in specs:
+        for col in range(cols):
+            for row in range(rows):
+                x = cx + (col - (cols - 1) / 2) * 105 + rng.uniform(-18, 18)
+                y = cy + (row - (rows - 1) / 2) * 105 + rng.uniform(-18, 18)
+                if apartments:
+                    sx, sy = rng.uniform(42, 66), rng.uniform(38, 58)
+                    height = rng.uniform(24, 52)
+                else:
+                    sx, sy = rng.uniform(30, 48), rng.uniform(30, 45)
+                    height = rng.uniform(8, 18)
+                building = _building(sx, sy, height, rng, is_downtown=apartments)
+                building.setPos(x, y, height / 2)
+                building.setH(rng.choice((0, 90, 180, 270)))
+                building.reparentTo(neighborhoods)
+        road = _flat_quad(cols * 110 + 100, 10, color=(0.12, 0.13, 0.14, 1))
+        road.setPos(cx, cy - rows * 55, 0.12)
+        road.reparentTo(neighborhoods)
+    neighborhoods.flattenStrong()
+    return neighborhoods
+
+
+def build_airport_vicinity(seed=61):
+    """Dense Heathrow-edge districts: homes, flats, workshops, and local roads."""
+    rng = random.Random(seed)
+    vicinity = NodePath('airport_vicinity')
+    house_colors = [
+        (0.55, 0.50, 0.46, 1), (0.68, 0.63, 0.56, 1),
+        (0.48, 0.52, 0.55, 1), (0.72, 0.68, 0.61, 1),
+    ]
+
+    # Heathrow-like districts outside the runway and terminal envelopes.
+    districts = [
+        # (center x, center y, columns, rows, spacing, apartment blocks)
+        (1200, 2750, 9, 7, 105, False),   # Cranford / Heston edge
+        (2600, 2850, 8, 6, 115, True),    # dense north-east flats
+        (1500, -2900, 10, 7, 100, False), # Feltham edge
+        (-5000, 1050, 9, 6, 115, False),  # Stanwell edge
+        (4300, -850, 8, 6, 125, True),    # industrial/residential east
+    ]
+    for cx, cy, cols, rows, spacing, apartments in districts:
+        district_w = (cols - 1) * spacing
+        district_h = (rows - 1) * spacing
+        for col in range(cols):
+            for row in range(rows):
+                x = cx + (col - (cols - 1) / 2) * spacing
+                y = cy + (row - (rows - 1) / 2) * spacing
+                if -4300 < x < 400 and -300 < y < 2100:
+                    continue
+                if apartments and (col + row) % 3 == 0:
+                    sx, sy, height = 72, 52, rng.uniform(28, 58)
+                else:
+                    sx, sy, height = rng.uniform(34, 58), rng.uniform(30, 48), rng.uniform(7, 16)
+                building = _box(sx, sy, height, rng.choice(house_colors))
+                roof = _box(sx * 0.92, sy * 0.92, 0.35,
+                            (0.25, 0.25, 0.27, 1))
+                roof.setZ(height / 2 + 0.2)
+                roof.reparentTo(building)
+                building.setPos(x, y, height / 2)
+                building.setH(rng.choice((0, 90, 180, 270)))
+                building.reparentTo(vicinity)
+
+        # Streets run along block edges, never through the building rows.
+        for row in range(rows + 1):
+            road = _flat_quad(district_w + spacing, 9,
+                              color=(0.12, 0.13, 0.14, 1))
+            road.setPos(cx, cy - district_h / 2 - spacing / 2 + row * spacing,
+                        0.13)
+            road.reparentTo(vicinity)
+        for col in range(cols + 1):
+            road = _flat_quad(9, district_h + spacing,
+                              color=(0.12, 0.13, 0.14, 1))
+            road.setPos(cx - district_w / 2 - spacing / 2 + col * spacing,
+                        cy, 0.13)
+            road.reparentTo(vicinity)
+
+        # Small green pocket at the edge of each district.
+        park = _flat_quad(district_w * 0.22, district_h * 0.18,
+                          color=(0.17, 0.40, 0.18, 1))
+        park.setPos(cx + district_w * 0.36, cy + district_h * 0.34, 0.14)
+        park.reparentTo(vicinity)
+
+    vicinity.flattenStrong()
+    return vicinity
+
+
+def build_villages(seed=47):
+    """Small distant settlements with homes, church towers, and field roads."""
+    rng = random.Random(seed)
+    villages = NodePath('villages')
+    specs = [(-7200, 5200, 24), (7600, -5600, 20), (-9000, -4300, 18)]
+    for cx, cy, count in specs:
+        for _ in range(count):
+            x = cx + rng.uniform(-500, 500)
+            y = cy + rng.uniform(-380, 380)
+            sx, sy = rng.uniform(14, 28), rng.uniform(12, 24)
+            height = rng.uniform(5, 11)
+            house = _building(sx, sy, height, rng, is_downtown=False)
+            house.setPos(x, y, height / 2)
+            house.setH(rng.choice((0, 90, 180, 270)))
+            house.reparentTo(villages)
+        road = _flat_quad(1100, 7, color=(0.20, 0.20, 0.18, 1))
+        road.setPos(cx, cy, 0.10)
+        road.reparentTo(villages)
+        tower = _cyl(2.2, 22, color=(0.55, 0.48, 0.38, 1),
+                     segments=8, axis='z')
+        tower.setPos(cx + 80, cy + 35, 11)
+        tower.reparentTo(villages)
+    villages.flattenStrong()
+    return villages
+
+
 
 
 # ----------------------------------------------------------------------
@@ -394,17 +679,17 @@ def build_river():
 
     # Main channel — flat quad
     channel = _flat_quad(80, 16000, color=water_col)
-    channel.setPos(6000, 0, 0.02)
+    channel.setPos(6000, 0, 0.16)
     channel.reparentTo(river)
 
     # A slight bend: extra quads offset a bit
     bend1 = _flat_quad(80, 4000, color=water_col)
-    bend1.setPos(6100, 4500, 0.02)
+    bend1.setPos(6100, 4500, 0.16)
     bend1.setH(-3)
     bend1.reparentTo(river)
 
     bend2 = _flat_quad(80, 4000, color=water_col)
-    bend2.setPos(5900, -4500, 0.02)
+    bend2.setPos(5900, -4500, 0.16)
     bend2.setH(3)
     bend2.reparentTo(river)
 
@@ -412,7 +697,7 @@ def build_river():
     bank_col = (0.55, 0.48, 0.32, 1)
     for side in (-1, 1):
         bank = _flat_quad(6, 16000, color=bank_col)
-        bank.setPos(6000 + side * 43, 0, 0.015)
+        bank.setPos(6000 + side * 43, 0, 0.17)
         bank.reparentTo(river)
 
     # A couple of bridges crossing the river
@@ -433,7 +718,7 @@ def build_river():
 # Terminal buildings + hangars + fuel tanks (the airport itself)
 # ----------------------------------------------------------------------
 def build_terminals():
-    """Large terminal buildings north of the runway."""
+    """Heathrow-inspired terminal and apron complex between the runways."""
     terminals = NodePath('terminals')
     terminal_col = (0.72, 0.72, 0.78, 1)
     roof_col = (0.5, 0.5, 0.55, 1)
@@ -467,6 +752,38 @@ def build_terminals():
     apron = _flat_quad(1400, 300, color=(0.16, 0.16, 0.17, 1))
     apron.setPos(-1500, 550, 0.008)
     apron.reparentTo(terminals)
+
+    # Central terminal spine and separated concourses between the runways.
+    glass_col = (0.20, 0.38, 0.48, 1)
+    central = _box(520, 110, 18, color=terminal_col)
+    central.setPos(-1250, 950, 9)
+    central.reparentTo(terminals)
+    central_roof = _box(540, 120, 2, color=glass_col)
+    central_roof.setPos(-1250, 950, 19)
+    central_roof.reparentTo(terminals)
+    for x in (-1950, -550):
+        concourse = _box(430, 55, 10, color=terminal_col)
+        concourse.setPos(x, 1220, 5)
+        concourse.reparentTo(terminals)
+        for gate_x in range(int(x - 160), int(x + 161), 80):
+            gate = _box(9, 55, 4, color=(0.58, 0.63, 0.68, 1))
+            gate.setPos(gate_x, 1165, 2)
+            gate.reparentTo(terminals)
+
+    # Western satellite terminals mirror the distributed Heathrow layout.
+    for x, y in ((-2850, 900), (-3200, 1320)):
+        satellite = _box(260, 70, 12, color=(0.66, 0.69, 0.74, 1))
+        satellite.setPos(x, y, 6)
+        satellite.reparentTo(terminals)
+
+    # Landside access loop and structured parking south of the terminal spine.
+    access = _flat_quad(1500, 18, color=(0.09, 0.10, 0.11, 1))
+    access.setPos(-1250, 700, 0.02)
+    access.reparentTo(terminals)
+    for x in range(-1850, -650, 70):
+        parking = _flat_quad(45, 210, color=(0.22, 0.24, 0.25, 1))
+        parking.setPos(x, 500, 0.02)
+        parking.reparentTo(terminals)
 
     return terminals
 
@@ -563,12 +880,28 @@ def build_buildings(seed=42):
         ( 8500, -1000,  700,  50, 30, False),
     ]
 
+    def clear_of_major_roads(x, y):
+        clear = not (
+            abs(x - 3500) < 90 or abs(x + 4500) < 90 or
+            abs(y - 2500) < 90 or abs(y + 2000) < 90
+        )
+        if abs(x - 5000) < 1500 and abs(y - 4000) < 1500:
+            for offset in (-1000, -500, 0, 500, 1000):
+                if (abs(y - (3000 + offset)) < 45 or
+                        abs(y - (5000 + offset)) < 45 or
+                        abs(x - (4000 + offset)) < 45 or
+                        abs(x - (6000 + offset)) < 45):
+                    return False
+        return clear
+
     for cx, cy, radius, n, max_h, is_dt in clusters:
         for _ in range(n):
             r = rng.random() ** 0.5 * radius
             th = rng.random() * 2 * math.pi
             x = cx + r * math.cos(th)
             y = cy + r * math.sin(th)
+            if not clear_of_major_roads(x, y):
+                continue
             sx = rng.uniform(18, 55) if is_dt else rng.uniform(12, 35)
             sy = rng.uniform(18, 55) if is_dt else rng.uniform(12, 35)
             dist_frac = r / radius
@@ -593,16 +926,22 @@ def build_city(seed=42):
     """
     world = NodePath('world_scenery')
 
-    _grass_patches(world, seed=seed + 1)
+    build_fields(seed=seed + 6).reparentTo(world)
     build_roads().reparentTo(world)
     build_river().reparentTo(world)
     build_terminals().reparentTo(world)
     build_hangars().reparentTo(world)
     build_buildings(seed=seed).reparentTo(world)
+    build_nearby_neighborhoods(seed=seed + 2).reparentTo(world)
+    build_airport_vicinity(seed=seed + 7).reparentTo(world)
+    build_parks(seed=seed + 4).reparentTo(world)
+    build_villages(seed=seed + 5).reparentTo(world)
     build_trees(seed=seed + 3).reparentTo(world)
-
+    build_night_lighting_group(seed=seed + 17).reparentTo(world)
     return world
-
+def build_city_lights():
+    """Deprecated — night lighting moved to night_lighting.py."""
+    return NodePath('deprecated_city_lights')
 
 # ----------------------------------------------------------------------
 # Lighting

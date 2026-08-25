@@ -31,6 +31,7 @@ python main.py
 | `plane_model.py` | Procedural A320 from primitives (boxes, cylinders) |
 | `scenery.py` | Runway, markings, lights (incl. PAPI), ground, city |
 | `hud.py` | Text HUD in the corners |
+| `audio.py` | Engine, runway, warning, and altitude callout audio |
 
 ## Controls
 
@@ -45,10 +46,11 @@ Primary: **mouse is the yoke** (on by default).
 | `Q` / `E` | Rudder |
 | `Shift` / `Ctrl` | Throttle up / down |
 | `B` (hold) | Wheel brakes |
-| `P` | Parking brake toggle |
+| `O` | Parking brake toggle |
+| `P` | Open setup menu / resume flight |
 | `G` | Landing gear toggle |
 | `F` / `V` | Flaps down / up one notch (0, 1, 2, 3, FULL) |
-| `R` | Reset to threshold |
+| `R` | Toggle full reverse thrust on/off while on the ground |
 | `F1` / `F2` | Chase camera / cockpit-ish camera |
 | `Esc` | Quit |
 
@@ -60,6 +62,11 @@ you always know which mode you're in.
 `self.mouse_sensitivity` (default 1.1). Bump sensitivity down to ~0.7
 if the aircraft feels too twitchy at cruise, or up to ~1.5 for
 snappier response on approach.
+
+Audio is generated and cached in `audio_cache/` on first launch. To use
+your own properly licensed recordings, place WAV files in `audio_assets/`
+using names such as `3000.wav`, `approaching_minimums.wav`, `retard.wav`,
+and `10.wav`; those files take priority over generated callouts.
 
 ## Starting position
 

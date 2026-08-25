@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 osm_processed.pkl
 osm_raw_cache/
+audio_cache/

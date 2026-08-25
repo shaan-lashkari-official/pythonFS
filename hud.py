@@ -7,39 +7,50 @@ This just gets you the numbers pilots and simmers actually watch.
 """
 
 from panda3d.core import TextNode
+from direct.gui.DirectGui import DirectFrame
 from direct.gui.OnscreenText import OnscreenText
 
 
 class HUD:
     def __init__(self):
+        self.left_panel = DirectFrame(
+            frameColor=(0.02, 0.06, 0.08, 0.72),
+            frameSize=(-1.92, -1.42, 0.56, 0.98),
+            pos=(0, 0, 0), relief=None,
+        )
+        self.right_panel = DirectFrame(
+            frameColor=(0.02, 0.06, 0.08, 0.72),
+            frameSize=(1.40, 1.92, 0.56, 0.98),
+            pos=(0, 0, 0), relief=None,
+        )
+
         # Top-left: primary flight numbers
-        self.spd  = self._make(-1.75,  0.90, 'SPD  ---')
-        self.alt  = self._make(-1.75,  0.83, 'ALT  ---')
-        self.hdg  = self._make(-1.75,  0.76, 'HDG  ---')
-        self.vs   = self._make(-1.75,  0.69, 'VS   ---')
-        self.gs   = self._make(-1.75,  0.62, 'GS   ---')
+        self.spd  = self._make(-1.78,  0.90, 'SPD  ---')
+        self.alt  = self._make(-1.78,  0.83, 'ALT  ---')
+        self.hdg  = self._make(-1.78,  0.76, 'HDG  ---')
+        self.vs   = self._make(-1.78,  0.69, 'VS   ---')
+        self.gs   = self._make(-1.78,  0.62, 'GS   ---')
 
         # Top-right: engine + config
-        self.n1    = self._make( 1.15,  0.90, 'N1   ---', align='right')
-        self.thr   = self._make( 1.15,  0.83, 'THR  ---', align='right')
-        self.flaps = self._make( 1.15,  0.76, 'FLAP ---', align='right')
-        self.gear  = self._make( 1.15,  0.69, 'GEAR ---', align='right')
-        self.brk   = self._make( 1.15,  0.62, 'BRK  ---', align='right')
-        self.spbrk = self._make( 1.15,  0.55, 'SPBRK ---', align='right')
+        self.n1    = self._make( 1.82,  0.90, 'N1   ---', align='right')
+        self.thr   = self._make( 1.82,  0.83, 'THR  ---', align='right')
+        self.flaps = self._make( 1.82,  0.76, 'FLAP ---', align='right')
+        self.gear  = self._make( 1.82,  0.69, 'GEAR ---', align='right')
+        self.brk   = self._make( 1.82,  0.62, 'BRK  ---', align='right')
+        self.spbrk = self._make( 1.82,  0.55, 'SPBRK ---', align='right')
 
         # Bottom center: control inputs (bar-ish text)
         self.ctrl = self._make(0.0, -0.90, '', align='center')
 
         # Bottom-right: yoke mode indicator
-        self.yoke = self._make(1.15, -0.90, 'YOKE MOUSE', align='right')
+        self.yoke = self._make(1.82, -0.90, 'YOKE MOUSE', align='right')
 
         # Bottom-left: help hint
         self.help = self._make(
-            -1.75, -0.95,
-            'Mouse=yoke  M=toggle  W/S=pitch  A/D=roll  Q/E=rudder  '
-            'Shift/Ctrl=throttle  H/J=speedbrake  B=brake  G=gear  '
-            'F/V=flaps  P=park brake  R=reset  Esc=quit',
-            scale=0.030,
+            -1.78, -0.95,
+            'M mouse  W/S pitch  A/D roll  Q/E rudder  Shift/Ctrl throttle  '
+            'C camera  T speedbrake  Space brake  G gear  F/V flaps  O park  P menu  Home reset  Esc quit',
+            scale=0.032,
         )
 
     def _make(self, x, y, text, align='left', scale=0.045):
