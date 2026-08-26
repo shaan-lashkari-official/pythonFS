@@ -127,6 +127,8 @@ class Sim(ShowBase):
         self._loading_update('Preparing flight audio...', 0.84)
         self.audio = AudioSystem(self.loader)
 
+        self._cam_lookat_pos = None   # populated on first frame of chase camera use
+
         self.shadow = create_aircraft_shadow(self.render)
         # --- Aircraft
         self.plane = build_a320()
@@ -176,6 +178,18 @@ class Sim(ShowBase):
         for k, alias in (('lshift', 'shift'), ('lcontrol', 'control')):
             self.accept(k,        self._key_down, [alias])
             self.accept(k + '-up', self._key_up,   [alias])
+
+        # Right mouse button — camera look-around
+        self.accept('mouse3', self._rmb_down)
+        self.accept('mouse3-up', self._rmb_up)
+
+        # Camera pan state
+        self.rmb_held = False
+        self.cam_pan_yaw_deg = 0.0      # + = looking right
+        self.cam_pan_pitch_deg = 0.0    # + = looking up
+        self._last_mouse_x = None
+        self._last_mouse_y = None
+        self.cam_pan_sensitivity = 120.0   # degrees per unit of mouse movement
 
         self.camera_mode = 'chase'    # 'chase' or 'cockpit'
         self.physics_accum = 0.0
@@ -355,6 +369,18 @@ class Sim(ShowBase):
         )
 
     # ------------------------------------------------------------------
+    def _rmb_down(self):
+        self.rmb_held = True
+        # Capture starting mouse position so first frame doesn't jump
+        if self.mouseWatcherNode.hasMouse():
+            self._last_mouse_x = self.mouseWatcherNode.getMouseX()
+            self._last_mouse_y = self.mouseWatcherNode.getMouseY()
+
+    def _rmb_up(self):
+        self.rmb_held = False
+        self._last_mouse_x = None
+        self._last_mouse_y = None
+    
     def _key_down(self, k):
         was_down = self.keys.get(k, False)
         self.keys[k] = True
@@ -382,6 +408,9 @@ class Sim(ShowBase):
             self.mouse_yoke = not self.mouse_yoke
         elif k == 'f1':
             self.camera_mode = 'chase'
+            self.cam_pan_yaw_deg = 0.0        # <-- add these two lines
+            self.cam_pan_pitch_deg = 0.0
+            self._cam_lookat_pos = None   # <-- add this so it re-captures
         elif k == 'f2':
             self.camera_mode = 'cockpit'
         elif k == 'c':
@@ -422,6 +451,10 @@ class Sim(ShowBase):
         DOWN = negative elevator in our sign scheme. So elevator = -mouseY.
         Mouse RIGHT = right roll = positive aileron. Aileron = mouseX.
         """
+        if self.rmb_held:
+            return None, None
+        if not self.mouseWatcherNode.hasMouse():
+            return None, None
         if not self.mouseWatcherNode.hasMouse():
             return None, None
         mx = self.mouseWatcherNode.getMouseX()
@@ -466,8 +499,8 @@ class Sim(ShowBase):
 
         # Rate-limit toward target so inputs feel less twitchy. Mouse is
         # already smooth, so allow a snappier response when mouse-driven.
-        elev_rate = 8 if (self.mouse_yoke and kb_elev == 0.0) else 4
-        ail_rate  = 10 if (self.mouse_yoke and kb_ail  == 0.0) else 6
+        elev_rate = 3 if (self.mouse_yoke and kb_elev == 0.0) else 2
+        ail_rate  = 4 if (self.mouse_yoke and kb_ail  == 0.0) else 3
         self.fd.elevator += (target_elev - self.fd.elevator) * min(1, dt * elev_rate)
         self.fd.aileron  += (target_ail  - self.fd.aileron)  * min(1, dt * ail_rate)
 
@@ -553,7 +586,7 @@ class Sim(ShowBase):
                 -self.fd.rudder * 25 if self.fd.on_ground() else 0
             )
 
-    def _update_camera(self):
+    def _update_camera(self,dt):
         forward_g, lateral_g, vertical_g = self.fd.body_acceleration_g()
         vertical_g -= 1.0
 
@@ -581,13 +614,52 @@ class Sim(ShowBase):
         self.camera_motion_hpr += (target_hpr - self.camera_motion_hpr) * blend
 
         if self.camera_mode == 'chase':
-            # 40m behind and 10m above the aircraft, looking at it
-            offset = self.plane.getQuat().xform(Vec3(0, -50, 12))
-            motion = self.plane.getQuat().xform(self.camera_motion)
-            cam_pos = self.plane.getPos() + offset + motion
-            self.camera.setPos(cam_pos)
-            self.camera.lookAt(self.plane, Point3(0, 0, 3))
-            self.camera.setHpr(self.camera.getHpr() + self.camera_motion_hpr)
+            from math import sin, cos, radians
+
+            # --- Compute the "ideal" camera position (where it would sit without smoothing)
+            base_dist = 50.0
+            base_height = 12.0
+
+            yaw = radians(self.cam_pan_yaw_deg)
+            pitch = radians(self.cam_pan_pitch_deg)
+            plane_h = radians(self.plane.getH())
+            total_yaw = plane_h + yaw
+
+            horiz_dist = base_dist * cos(pitch)
+            vert_offset = base_height + base_dist * sin(pitch)
+
+            target_cam_x = self.plane.getX() - sin(total_yaw) * horiz_dist
+            target_cam_y = self.plane.getY() + cos(total_yaw) * horiz_dist
+            target_cam_z = self.plane.getZ() + vert_offset
+
+            # --- Smooth the camera position toward the target
+            # Higher smoothing_factor = camera catches up faster (less lag)
+            # Lower = more lag, more stable-feeling
+            pos_smoothing = 3.5   # ~0.3 sec time constant
+            alpha = min(1.0, dt * pos_smoothing)
+
+            current = self.camera.getPos()
+            new_x = current.x + (target_cam_x - current.x) * alpha
+            new_y = current.y + (target_cam_y - current.y) * alpha
+            new_z = current.z + (target_cam_z - current.z) * alpha
+            self.camera.setPos(new_x, new_y, new_z)
+
+            # --- Smoothed aim point
+            # Camera looks at a lagged version of the aircraft position, so
+            # pitch/roll oscillations don't jerk the view around.
+            if self._cam_lookat_pos is None:
+                self._cam_lookat_pos = self.plane.getPos() + Vec3(0, 0, 3)
+
+            target_lookat = self.plane.getPos() + Vec3(0, 0, 3)
+            lookat_smoothing = 4.5   # aim smoothing slightly faster than position
+            beta = min(1.0, dt * lookat_smoothing)
+
+            lx = self._cam_lookat_pos.x + (target_lookat.x - self._cam_lookat_pos.x) * beta
+            ly = self._cam_lookat_pos.y + (target_lookat.y - self._cam_lookat_pos.y) * beta
+            lz = self._cam_lookat_pos.z + (target_lookat.z - self._cam_lookat_pos.z) * beta
+            self._cam_lookat_pos = Vec3(lx, ly, lz)
+
+            self.camera.lookAt(self._cam_lookat_pos)
         else:  # cockpit-ish: at nose, looking forward with plane
             fwd_offset = self.plane.getQuat().xform(Vec3(0, 16.5, 2.5))
             motion = self.plane.getQuat().xform(self.camera_motion)
@@ -595,7 +667,28 @@ class Sim(ShowBase):
             self.camera.setHpr(self.plane.getHpr() + self.camera_motion_hpr)
             # Nudge pitch down a touch so horizon sits naturally
             self.camera.setP(self.camera.getP() - 3)
+            
+    def _update_camera_pan(self):
+        if not self.rmb_held or not self.mouseWatcherNode.hasMouse():
+            return
+        mx = self.mouseWatcherNode.getMouseX()
+        my = self.mouseWatcherNode.getMouseY()
+        if self._last_mouse_x is None:
+            self._last_mouse_x = mx
+            self._last_mouse_y = my
+            return
+        dx = mx - self._last_mouse_x
+        dy = my - self._last_mouse_y
+        self._last_mouse_x = mx
+        self._last_mouse_y = my
 
+        # Accumulate pan angles
+        self.cam_pan_yaw_deg   += dx * self.cam_pan_sensitivity
+        self.cam_pan_pitch_deg += dy * self.cam_pan_sensitivity
+
+        # Clamp so you can't spin all the way around/underneath
+        self.cam_pan_yaw_deg   = max(-180, min(180, self.cam_pan_yaw_deg))
+        self.cam_pan_pitch_deg = max(-60,  min(60,  self.cam_pan_pitch_deg))
     # ------------------------------------------------------------------
     def _update(self, task):
         if not self.sim_started:
@@ -605,6 +698,7 @@ class Sim(ShowBase):
         dt = min(dt, 0.1)
         
         self._apply_inputs(dt)
+        self._update_camera_pan() 
         self.touchdown_kick *= max(0.0, 1.0 - dt * 4.5)
         self.crash_kick *= max(0.0, 1.0 - dt * 2.8)
         suspension_target = -self.touchdown_kick * 0.16
@@ -653,7 +747,7 @@ class Sim(ShowBase):
 
         self._sync_plane_to_physics()
         self._animate_surfaces()
-        self._update_camera()
+        self._update_camera(dt)
         self.audio.update(self.fd)
         update_dynamic_night_lights(self.night_pool, self.plane.getPos())
 

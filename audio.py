@@ -365,8 +365,14 @@ class AudioSystem:
     def update(self, fd):
         n1 = max(0.0, min(100.0, fd.n1_percent()))
         if self.engine is not None:
-            self.engine.setVolume(0.06 + n1 / 100.0 * 0.22)
-            self.engine.setPlayRate(0.72 + n1 / 100.0 * 0.58)
+            # Cubic curve on volume so idle stays quiet but full thrust hits hard.
+            # Volume: 0.10 at idle -> 0.85 at full thrust (much more powerful).
+            n1_norm = n1 / 100.0
+            volume = 0.10 + (n1_norm ** 1.5) * 0.75
+            self.engine.setVolume(min(1.0, volume))
+            # Deeper at idle (0.55 = 45% slower), higher at full (1.45).
+            # Wider pitch range gives more perceived power difference.
+            self.engine.setPlayRate(0.55 + n1_norm * 0.90)
 
         stall = fd.airspeed_kt() < 110.0 and fd.agl_ft() > 50.0
         overspeed = fd.airspeed_kt() > 320.0

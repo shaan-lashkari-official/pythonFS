@@ -67,7 +67,7 @@ import jsbsim
 # EGLL (Heathrow) runway 27L threshold, roughly
 EGLL_LAT_DEG = 51.4775
 EGLL_LON_DEG = -0.4340
-EGLL_ELEV_FT = 83.0
+EGLL_ELEV_FT = 86
 RUNWAY_HDG_DEG = 270.0
 
 METERS_PER_DEG_LAT = 111320.0
@@ -128,8 +128,8 @@ class FlightDynamics:
         # roughly typical departure weight. Higher weight = more tyre
         # friction, which reduces the 'sliding on ice' feel too.
         try:
-            self.fdm['propulsion/tank[0]/contents-lbs'] = 5500
-            self.fdm['propulsion/tank[1]/contents-lbs'] = 5500
+            self.fdm['propulsion/tank[0]/contents-lbs'] = 7000
+            self.fdm['propulsion/tank[1]/contents-lbs'] = 7000
         except (KeyError, Exception):
             pass
 
@@ -170,6 +170,11 @@ class FlightDynamics:
         self._touchdown_timer = 0.0          # counts up after each touchdown
         self._auto_spoilers_deployed = False
         self._wing_drop_side = 0             # -1, 0, +1
+        # Airbus-style attitude hold state (C* FBW approximation)
+        self._pitch_hold_target = None      # deg — captured pitch to hold
+        self._bank_hold_target = None       # deg — captured bank to hold
+        self._pitch_hold_correction = 0.0   # elevator offset from hold
+        self._bank_hold_correction = 0.0    # aileron offset from hold        
 
         # Feature toggles (main.py can flip these if you want to
         # temporarily disable an assist to test the raw JSBSim behaviour)
@@ -376,26 +381,67 @@ class FlightDynamics:
         if self.airspeed_kt() < 80:
             return 0.0
         return math.sin(roll) * 0.4
+    def _flight_stability(self):
+        """
+        Airbus-style attitude hold. When stick is centered, aircraft holds
+        the pitch and bank it had at the moment you released. This is
+        NOT autopilot — it's what the A320 fly-by-wire does in Normal Law
+        (C* control law approximation).
 
-    def _auto_trim(self):
-        """Ease pitch trim toward held elevator so cruise can be hands-off."""
-        if not self.enable_auto_trim or self.on_ground():
+        When you move the stick, you're commanding a change to the held
+        attitude. Release, and the new attitude becomes the target.
+
+        Only active in the air, above 200 ft AGL, and only when flap
+        setting is 3 or lower (approach + landing use direct control).
+        """
+        if self.on_ground() or self.agl_ft() < 200:
+            # Reset holds so they don't kick in on next takeoff
+            self._pitch_hold_target = None
+            self._bank_hold_target = None
             return
-        airspeed = self.airspeed_kt()
-        if airspeed < 100 or airspeed > 350:
-            return
+
         try:
-            current_trim = float(self.fdm['fcs/pitch-trim-cmd-norm'])
+            pitch_deg = math.degrees(float(self.fdm['attitude/theta-rad']))
+            bank_deg = math.degrees(float(self.fdm['attitude/phi-rad']))
+            pitch_rate = float(self.fdm['velocities/q-rad_sec'])
+            roll_rate = float(self.fdm['velocities/p-rad_sec'])
         except (KeyError, Exception):
             return
-        if abs(self.elevator) > 0.05:
-            new_trim = current_trim + self.elevator * 0.02 * self.dt
-            new_trim = max(-1.0, min(1.0, new_trim))
-            try:
-                self.fdm['fcs/pitch-trim-cmd-norm'] = new_trim
-            except (KeyError, Exception):
-                pass
 
+        # PITCH HOLD --------------------------------------------------
+        if abs(self.elevator) < 0.08:
+            # Stick centered — capture current pitch if not held yet
+            if self._pitch_hold_target is None:
+                self._pitch_hold_target = pitch_deg
+            # Compute correction: pitch error + damping on pitch rate
+            pitch_err = self._pitch_hold_target - pitch_deg
+            # Proportional + rate damping
+            correction = pitch_err * 0.04 - pitch_rate * 3.0
+            # Clamp to reasonable range so it doesn't fight big disturbances
+            correction = max(-0.3, min(0.3, correction))
+            # Add to elevator command (will be applied in set_controls)
+            self._pitch_hold_correction = correction
+        else:
+            # Pilot is actively pitching — release hold, update target
+            self._pitch_hold_target = pitch_deg
+            self._pitch_hold_correction = 0.0
+
+        # BANK HOLD ---------------------------------------------------
+        if abs(self.aileron) < 0.08:
+            if self._bank_hold_target is None:
+                self._bank_hold_target = bank_deg
+            # Airbus holds bank up to 33°, then rolls back toward 33°
+            target = self._bank_hold_target
+            if abs(target) > 33:
+                target = 33 * (1 if target > 0 else -1)
+                self._bank_hold_target = target
+            bank_err = target - bank_deg
+            correction = bank_err * 0.03 - roll_rate * 2.0
+            correction = max(-0.3, min(0.3, correction))
+            self._bank_hold_correction = correction
+        else:
+            self._bank_hold_target = bank_deg
+            self._bank_hold_correction = 0.0
     def _apply_ground_effect(self):
         """
         Boost lift + trim drag when the aircraft is close to the ground.
@@ -471,11 +517,14 @@ class FlightDynamics:
         self.fdm['fcs/throttle-cmd-norm']    = eff_throttle
         self.fdm['fcs/throttle-cmd-norm[1]'] = eff_throttle
 
-        # --- Enhanced elevator (stall buffet + touchdown assist)
+
+        # --- Enhanced elevator (stall buffet + touchdown assist + attitude hold)
         buffet_pitch, buffet_roll = self._stall_effects()
         assisted_elev = self._touchdown_assist_elev(self.elevator)
-        eff_elev = max(-1.0, min(1.0, assisted_elev + buffet_pitch))
-        eff_ail  = max(-1.0, min(1.0, self.aileron + buffet_roll))
+        eff_elev = max(-1.0, min(1.0,
+            assisted_elev + buffet_pitch + self._pitch_hold_correction))
+        eff_ail  = max(-1.0, min(1.0,
+            self.aileron + buffet_roll + self._bank_hold_correction))
         self.fdm['fcs/elevator-cmd-norm'] = eff_elev
         self.fdm['fcs/aileron-cmd-norm']  = eff_ail
 
@@ -503,7 +552,7 @@ class FlightDynamics:
         # (so the timer/flags are current when set_controls fires)
         self._touchdown_and_takeoff_detection()
         self._auto_ground_spoilers()
-        self._auto_trim()
+        self._flight_stability()
         self._apply_ground_effect()   # <-- ADD THIS LINE
         self.set_controls()   # existing
 
