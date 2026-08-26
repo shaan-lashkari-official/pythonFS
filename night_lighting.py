@@ -99,7 +99,19 @@ STREETLAMP_POSITIONS = _generate_streetlamp_positions()
 # Batched street-lamp ground pools (additive blend)
 # ---------------------------------------------------------------------
 def build_streetlamp_pools():
-    """One Geom, one draw call, ~1500 warm ground pools."""
+    """
+    One Geom, one draw call, ~1500 warm street lamp pools.
+
+    Each lamp gets TWO radial discs (fan-triangulated):
+      - inner core: bright, tight (6m radius)
+      - outer glow: dim, wide (22m radius)
+    Per-vertex color goes from warm-orange center to transparent edge,
+    which Panda3D interpolates across the fan triangles. Combined with
+    additive blending, this reads as soft natural light spread on the
+    ground instead of hard rectangles.
+    """
+    import math
+
     fmt = GeomVertexFormat.getV3n3c4()
     vdata = GeomVertexData('pools', fmt, Geom.UHStatic)
     vw = GeomVertexWriter(vdata, 'vertex')
@@ -107,19 +119,48 @@ def build_streetlamp_pools():
     cw = GeomVertexWriter(vdata, 'color')
     tris = GeomTriangles(Geom.UHStatic)
 
-    color = (0.95, 0.55, 0.18, 0.85)
-    pool_r = 9.0
+    edge_color = (1.0, 0.55, 0.15, 0.0)   # transparent rim
+    core_color = (1.0, 0.75, 0.30, 0.95)  # bright warm center
+    glow_color = (1.0, 0.55, 0.15, 0.35)  # softer wide halo
+
+    segments = 12   # rim vertices per disc
     idx = 0
 
     for x, y in STREETLAMP_POSITIONS:
-        for dx, dy in ((-pool_r, -pool_r), (pool_r, -pool_r),
-                       (pool_r,  pool_r), (-pool_r,  pool_r)):
-            vw.addData3(x + dx, y + dy, 0.20)
+        # Inner core - bright, small
+        # Center vertex
+        vw.addData3(x, y, 0.20)
+        nw.addData3(0, 0, 1)
+        cw.addData4(*core_color)
+        # Rim vertices
+        for i in range(segments):
+            a = 2 * math.pi * i / segments
+            vx = x + math.cos(a) * 6.0
+            vy = y + math.sin(a) * 6.0
+            vw.addData3(vx, vy, 0.20)
             nw.addData3(0, 0, 1)
-            cw.addData4(*color)
-        tris.addVertices(idx,     idx + 1, idx + 2)
-        tris.addVertices(idx,     idx + 2, idx + 3)
-        idx += 4
+            cw.addData4(*edge_color)
+        # Fan triangles
+        for i in range(segments):
+            ni = (i + 1) % segments
+            tris.addVertices(idx, idx + 1 + i, idx + 1 + ni)
+        idx += 1 + segments   # center + rim
+
+        # Outer glow - dim, wide
+        vw.addData3(x, y, 0.15)
+        nw.addData3(0, 0, 1)
+        cw.addData4(*glow_color)
+        for i in range(segments):
+            a = 2 * math.pi * i / segments
+            vx = x + math.cos(a) * 22.0
+            vy = y + math.sin(a) * 22.0
+            vw.addData3(vx, vy, 0.15)
+            nw.addData3(0, 0, 1)
+            cw.addData4(*edge_color)
+        for i in range(segments):
+            ni = (i + 1) % segments
+            tris.addVertices(idx, idx + 1 + i, idx + 1 + ni)
+        idx += 1 + segments
 
     geom = Geom(vdata); geom.addPrimitive(tris)
     node = GeomNode('streetlamp_pools'); node.addGeom(geom)
@@ -133,7 +174,6 @@ def build_streetlamp_pools():
     np.setDepthWrite(False)
     np.setBin('transparent', 20)
     return np
-
 
 # ---------------------------------------------------------------------
 # Batched district windows — vertical quads on real building faces
@@ -244,65 +284,26 @@ def build_district_windows(seed=17):
 # Ambient district glow — broad soft warm quads under dense areas
 # ---------------------------------------------------------------------
 def build_ambient_glow_patches():
-    """Batched soft glow so distant cities show as warm-tinted areas."""
-    fmt = GeomVertexFormat.getV3n3c4()
-    vdata = GeomVertexData('glow', fmt, Geom.UHStatic)
-    vw = GeomVertexWriter(vdata, 'vertex')
-    nw = GeomVertexWriter(vdata, 'normal')
-    cw = GeomVertexWriter(vdata, 'color')
-    tris = GeomTriangles(Geom.UHStatic)
-
-    color = (0.95, 0.48, 0.15, 0.10)   # subtle
-    idx = 0
-
-    for cx, cy, cols, rows, spacing, _ in DISTRICT_SPECS:
-        w = cols * spacing * 1.6
-        h = rows * spacing * 1.6
-        for dx, dy in ((-w/2, -h/2), (w/2, -h/2), (w/2, h/2), (-w/2, h/2)):
-            vw.addData3(cx + dx, cy + dy, 0.10)
-            nw.addData3(0, 0, 1)
-            cw.addData4(*color)
-        tris.addVertices(idx,     idx + 1, idx + 2)
-        tris.addVertices(idx,     idx + 2, idx + 3)
-        idx += 4
-
-    geom = Geom(vdata); geom.addPrimitive(tris)
-    node = GeomNode('ambient_glow'); node.addGeom(geom)
-    np = NodePath(node)
-    np.setName('ambient_glow')
-    np.setTransparency(TransparencyAttrib.MAlpha)
-    np.setAttrib(ColorBlendAttrib.make(ColorBlendAttrib.MAdd,
-                                       ColorBlendAttrib.OIncomingAlpha,
-                                       ColorBlendAttrib.OOne))
-    np.setLightOff()
-    np.setDepthWrite(False)
-    np.setBin('transparent', 10)
-    return np
-
+    """Deprecated — was creating fake dark AO patches under buildings.
+    Real dynamic PointLights now handle this properly."""
+    return NodePath('ambient_glow_disabled')
 
 # ---------------------------------------------------------------------
 # One-shot: build everything as a hideable group
 # ---------------------------------------------------------------------
 def build_night_lighting_group(seed=17):
-    """
-    Returns a single NodePath 'night_lighting' with all batched night
-    elements. Reparent this to your world node — starts hidden. Toggle
-    with set_night_mode().
-    """
     root = NodePath('night_lighting')
-    build_ambient_glow_patches().reparentTo(root)
     build_streetlamp_pools().reparentTo(root)
     build_district_windows(seed=seed).reparentTo(root)
-    root.hide()   # start off
+    root.hide()
     return root
-
 
 # ---------------------------------------------------------------------
 # Real PointLights that follow the aircraft
 # ---------------------------------------------------------------------
 def create_dynamic_night_lights(render, count=6,
                                 color=(1.0, 0.72, 0.32, 1),
-                                attenuation=(1.0, 0.05, 0.006)):
+                                attenuation=(1.0, 0.02, 0.002)):
     """
     Create `count` PointLight nodes attached to `render`. They start
     off-screen and disabled. Call enable_dynamic_night_lights() and

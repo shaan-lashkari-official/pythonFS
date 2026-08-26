@@ -61,6 +61,7 @@ swap to a higher-fidelity aircraft XML, most of this can be removed.
 """
 
 import math
+import os
 import random
 import jsbsim
 
@@ -92,6 +93,12 @@ class FlightDynamics:
         self.weather = weather or {}
         self.fdm = jsbsim.FGFDMExec(None)
         self.fdm.set_debug_level(0)
+
+        # Use local aircraft/ dir (with corrected steering + friction)
+        # if it exists, otherwise fall back to the JSBSim package default.
+        local_aircraft = os.path.join(os.path.dirname(__file__), 'aircraft')
+        if os.path.isdir(os.path.join(local_aircraft, 'A320')):
+            self.fdm.set_aircraft_path(local_aircraft)
 
         if not self.fdm.load_model('A320'):
             raise RuntimeError(
@@ -250,20 +257,19 @@ class FlightDynamics:
 
         gs = self._get_ground_speed_kt_raw()
 
-        # Nose-wheel gain schedule — much more aggressive at low speed.
-        # The multiplier scales the -1..1 rudder command; the actual deflection
-        # angle depends on JSBSim's steer-cmd-norm interpretation, but this
-        # sends max signal so the model deflects as far as its XML allows.
+        # Nose-wheel gain schedule — calibrated for the 75-degree tiller range
+        # in the local A320.xml. At low speed the full 75 deg is available;
+        # as speed rises, deflection tapers for stability.
         if gs < 10:
-            steer_gain = 2.5   # push past normal saturation — some models honour this
+            steer_gain = 1.0   # full 75-deg tiller
         elif gs < 25:
-            steer_gain = 2.0
+            steer_gain = 0.8
         elif gs < 45:
-            steer_gain = 1.5 - (gs - 25) / 20.0 * 0.8
+            steer_gain = 0.6 - (gs - 25) / 20.0 * 0.3
         elif gs < 70:
-            steer_gain = 0.7 - (gs - 45) / 25.0 * 0.4
+            steer_gain = 0.3 - (gs - 45) / 25.0 * 0.15
         else:
-            steer_gain = 0.3
+            steer_gain = 0.10
 
         steer = max(-1.0, min(1.0, -self.rudder * steer_gain))
 
@@ -288,7 +294,8 @@ class FlightDynamics:
             if v_side_fps > 1.0:   # sliding more than ~0.6 kt sideways
                 # Scale brake pulse with slip amount. Both wheels, not
                 # differential — we're just killing the slide.
-                slide_brake = min(0.5, v_side_fps / 12.0)
+                # Reduced from 0.5/12 since real friction values now handle most of it.
+                slide_brake = min(0.25, v_side_fps / 20.0)
                 left_brake  = min(1.0, left_brake  + slide_brake)
                 right_brake = min(1.0, right_brake + slide_brake)
 
@@ -553,9 +560,7 @@ class FlightDynamics:
         self._touchdown_and_takeoff_detection()
         self._auto_ground_spoilers()
         self._flight_stability()
-        self._apply_ground_effect()   # <-- ADD THIS LINE
-        self.set_controls()   # existing
-
+        self._apply_ground_effect()
         self.set_controls()
 
         if self.belly_contact:
@@ -639,6 +644,13 @@ class FlightDynamics:
 
     def on_ground(self):
         return bool(self.fdm['gear/wow'])
+
+    def gear_position_norm(self):
+        """0.0 = fully retracted, 1.0 = fully extended."""
+        try:
+            return float(self.fdm['gear/gear-pos-norm'])
+        except (KeyError, Exception):
+            return 1.0 if self.gear_down else 0.0
 
     def body_acceleration_g(self):
         return (

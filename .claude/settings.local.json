@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc:*)",
+      "Bash(ls:*)",
+      "Bash(python:*)",
+      "WebSearch",
+      "WebFetch(domain:docs.flybywiresim.com)",
+      "WebFetch(domain:www.aviationhunt.com)",
+      "WebFetch(domain:www.simvol.org)",
+      "Bash(glow:*)",
+      "Bash(light:*)",
+      "Bash(effect \")",
+      "WebFetch(domain:www.airlinerspotter.com)"
+    ]
+  }
+}

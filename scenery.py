@@ -122,6 +122,8 @@ def build_ground(size=30000.0):
     """Vibrant low-relief countryside surrounding a level airport basin."""
     ground = _terrain_mesh(size)
     ground.setZ(-0.08)
+    ground.clearLight()          # explicitly ensure lighting works
+    ground.setTwoSided(True)     # let light hit either side
     return ground
 
 
@@ -290,19 +292,71 @@ def build_heathrow_parallel_runway(length=3650.0, width=45.0,
 # Runway lights (unchanged from v1)
 # ----------------------------------------------------------------------
 def _light_point(color=(1, 1, 1, 1), size=1.5):
-    cm = CardMaker('light')
-    cm.setFrame(-size / 2, size / 2, -size / 2, size / 2)
-    np = NodePath(cm.generate())
-    np.setColor(*color)
+    """
+    Runway light: bright billboard card with radial glow.
+    Uses CardMaker-style geometry so the light always faces the camera
+    (visible from any angle, including straight above at cruise altitude).
+    Three concentric additive layers create a photo-realistic bulb glow.
+
+    Absolute radii capped so bigger `size` inputs (like PAPI at 1.6)
+    don't produce room-sized glows.
+    """
+    import math
+    from panda3d.core import (
+        Geom, GeomNode, GeomVertexData, GeomVertexFormat, GeomVertexWriter,
+        GeomTriangles, NodePath, TransparencyAttrib, ColorBlendAttrib,
+    )
+
+    r, g, b, _ = color
+
+    # Absolute (capped) radii — decoupled from the input `size` so all
+    # runway light types get sensibly-scaled glows.
+    core_r  = min(size * 0.30, 0.5)   # sharp bright pinpoint
+    halo_r  = min(size * 0.75, 1.1)   # bright halo
+    bloom_r = min(size * 1.60, 2.2)   # dim outer glow
+
+    layers = [
+        (core_r,  (r, g, b, 1.0)),
+        (halo_r,  (r, g, b, 0.65)),
+        (bloom_r, (r, g, b, 0.25)),
+    ]
+    edge_color = (r, g, b, 0.0)
+    segments = 12
+
+    fmt = GeomVertexFormat.getV3n3c4()
+    vdata = GeomVertexData('rwy_light', fmt, Geom.UHStatic)
+    vw = GeomVertexWriter(vdata, 'vertex')
+    nw = GeomVertexWriter(vdata, 'normal')
+    cw = GeomVertexWriter(vdata, 'color')
+    tris = GeomTriangles(Geom.UHStatic)
+
+    idx = 0
+    for radius, center_color in layers:
+        vw.addData3(0, 0, 0)
+        nw.addData3(0, 1, 0)
+        cw.addData4(*center_color)
+        for i in range(segments):
+            a = 2 * math.pi * i / segments
+            vw.addData3(math.cos(a) * radius, 0, math.sin(a) * radius)
+            nw.addData3(0, 1, 0)
+            cw.addData4(*edge_color)
+        for i in range(segments):
+            ni = (i + 1) % segments
+            tris.addVertices(idx, idx + 1 + i, idx + 1 + ni)
+        idx += 1 + segments
+
+    geom = Geom(vdata); geom.addPrimitive(tris)
+    node = GeomNode('rwy_light'); node.addGeom(geom)
+    np = NodePath(node)
     np.setTransparency(TransparencyAttrib.MAlpha)
     np.setAttrib(ColorBlendAttrib.make(ColorBlendAttrib.MAdd,
                                        ColorBlendAttrib.OIncomingAlpha,
                                        ColorBlendAttrib.OOne))
     np.setLightOff()
+    np.setDepthWrite(False)
+    np.setBin('transparent', 22)
     np.setBillboardPointEye()
     return np
-
-
 def build_runway_lights(length=3902.0, width=45.0, center_y=0.0,
                         name='runway_lights', prefix=''):
     """Build threshold, edge, PAPI, and approach lights for one runway."""
@@ -352,29 +406,119 @@ def build_runway_lights(length=3902.0, width=45.0, center_y=0.0,
         l.reparentTo(papi_parent)
     papi_parent.reparentTo(lights)
 
-    # Approach lighting centerline extension
-    for i in range(1, 20):
-        l = _light_point((1, 1, 1, 1), size=1.4)
-        l.setPos(i * 30.0, center_y, 0.5); l.reparentTo(lights)
-    # Crossbar
-    for j in range(-4, 5):
-        l = _light_point((1, 1, 1, 1), size=1.2)
-        l.setPos(300, center_y + j * 4, 0.5); l.reparentTo(lights)
+    build_alsf2_approach(threshold_x=0, threshold_y=0).reparentTo(lights)
 
     return lights
 
 
-def update_papi(scene_root, aircraft_east, aircraft_up, center_y=0.0,
-                prefix=''):
-    """4-bulb PAPI: red/white based on angle to touchdown zone."""
+
+# =====================================================================
+# ALSF-II APPROACH LIGHTING SYSTEM
+# =====================================================================
+APPROACH_LIGHT_SPACING = 30.0
+APPROACH_N_ROWS = 30
+BAR_LIGHT_SPACING = 1.5
+BAR_LIGHTS_PER_ROW = 5
+RABBIT_LIGHT_SPACING = 30.0
+RABBIT_N_LIGHTS = 20
+CROSSBAR_DISTANCE_M = 300.0
+CROSSBAR_WIDTH_M = 30.0
+CROSSBAR_LIGHTS = 20
+
+
+def build_alsf2_approach(threshold_x=0, threshold_y=0):
+    """
+    Full ALSF-II approach lighting: centerline bars, sequenced flashers
+    (rabbit — animated by update_rabbit_lights), 300m crossbar, threshold
+    wing bars, green threshold lights.
+    """
+    root = NodePath('alsf2_approach_lighting')
+
+    # Centerline bars (5-light bars every 30m)
+    centerline = NodePath('alsf_centerline')
+    for row in range(1, APPROACH_N_ROWS + 1):
+        x = threshold_x + row * APPROACH_LIGHT_SPACING
+        for lat in range(BAR_LIGHTS_PER_ROW):
+            offset = (lat - (BAR_LIGHTS_PER_ROW - 1) / 2) * BAR_LIGHT_SPACING
+            l = _light_point((1, 1, 1, 1), size=0.9)
+            l.setPos(x, threshold_y + offset, 0.5)
+            l.reparentTo(centerline)
+    centerline.reparentTo(root)
+
+    # Sequenced flashers (rabbit) — named individually for animation
+    rabbit = NodePath('alsf_rabbit')
+    for i in range(RABBIT_N_LIGHTS):
+        x = threshold_x + (i + 1) * RABBIT_LIGHT_SPACING
+        l = _light_point((1, 1, 1, 1), size=1.4)
+        l.setName(f'rabbit_{i}')
+        l.setPos(x, threshold_y, 0.7)
+        l.setColorScale(0.4, 0.4, 0.4, 1)
+        l.reparentTo(rabbit)
+    rabbit.reparentTo(root)
+
+    # 300m crossbar
+    crossbar = NodePath('alsf_crossbar')
+    for i in range(CROSSBAR_LIGHTS):
+        offset = (i - (CROSSBAR_LIGHTS - 1) / 2) * (CROSSBAR_WIDTH_M / CROSSBAR_LIGHTS)
+        l = _light_point((1, 1, 1, 1), size=1.0)
+        l.setPos(threshold_x + CROSSBAR_DISTANCE_M, threshold_y + offset, 0.5)
+        l.reparentTo(crossbar)
+    crossbar.reparentTo(root)
+
+    # Threshold wing bars (red bars flanking runway start)
+    wing_bars = NodePath('alsf_wing_bars')
+    runway_half_width = 22.5
+    for side in (-1, 1):
+        for j in range(8):
+            l = _light_point((1.0, 0.15, 0.05, 1), size=1.1)
+            l.setPos(threshold_x,
+                     threshold_y + side * (runway_half_width + 3 + j * 1.5),
+                     0.5)
+            l.reparentTo(wing_bars)
+    wing_bars.reparentTo(root)
+
+    # Green threshold lights across runway start
+    threshold = NodePath('alsf_threshold')
+    for i in range(15):
+        offset = (i - 7) * (45.0 / 15)
+        l = _light_point((0.15, 1.0, 0.25, 1), size=1.1)
+        l.setPos(threshold_x - 1, threshold_y + offset, 0.5)
+        l.reparentTo(threshold)
+    threshold.reparentTo(root)
+
+    return root
+
+
+def update_rabbit_lights(cached_nodes, current_time):
+    """
+    Sequenced flashing 'rabbit'. Call every frame from main.py::_update.
+    One light bright, sweeping from far end toward threshold at 2 Hz.
+    cached_nodes: pre-built list of rabbit NodePaths (avoids find() each frame).
+    """
+    cycle_duration = 0.5
+    phase = (current_time % cycle_duration) / cycle_duration
+    active_idx = int((1.0 - phase) * RABBIT_N_LIGHTS)
+    for i, node in enumerate(cached_nodes):
+        if node.isEmpty():
+            continue
+        if i == active_idx:
+            node.setColorScale(4.0, 4.0, 4.0, 1)
+        elif abs(i - active_idx) == 1:
+            node.setColorScale(1.2, 1.2, 1.2, 1)
+        else:
+            node.setColorScale(0.35, 0.35, 0.35, 1)
+
+def update_papi(cached_nodes, aircraft_east, aircraft_up, center_y=0.0):
+    """4-bulb PAPI: red/white based on angle to touchdown zone.
+    cached_nodes: pre-built list of 4 PAPI NodePaths (avoids find() each frame).
+    """
     # PAPI is meaningful only when the aircraft is on the approach side.
     dx = aircraft_east - (-300.0)
     if dx <= 0:
         return
     angle_deg = math.degrees(math.atan2(max(aircraft_up, 0.1), dx))
     transitions = [2.5, 2.83, 3.17, 3.5]
-    for i, t in enumerate(transitions):
-        node = scene_root.find(f'**/{prefix}papi_{i}')
+    for node, t in zip(cached_nodes, transitions):
         if node.isEmpty():
             continue
         node.setColor(1, 1, 1, 1) if angle_deg > t else node.setColor(1, 0.15, 0.05, 1)
@@ -956,7 +1100,7 @@ def add_lighting(render):
     sun = DirectionalLight('sun')
     sun.setColor((0.95, 0.88, 0.75, 1))
     sun_np = render.attachNewNode(sun)
-    sun_np.setHpr(-40, -50, 0)
+    # Sun direction is set dynamically by main.py::_apply_time_of_day()
     render.setLight(sun_np)
 
     return amb_np, sun_np

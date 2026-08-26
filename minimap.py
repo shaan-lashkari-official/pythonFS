@@ -9,6 +9,7 @@ Redraws each frame — cheap enough for the small number of features we
 have. If you add many more features, batch static ones.
 """
 
+import math
 from panda3d.core import (
     NodePath, CardMaker, LineSegs, TransparencyAttrib, Vec4, TextNode,
 )
@@ -94,8 +95,9 @@ class Minimap:
         border.drawTo(-h, 0, -h)
         self.root.attachNewNode(border.create())
 
-        # Container that we clear + repopulate each frame (dynamic features)
+        # Container for static features — built once, translated each frame
         self.content = self.root.attachNewNode('content')
+        self._build_features()
 
         # Aircraft indicator (persistent, rotated each frame)
         self.aircraft_marker = self._make_aircraft_marker()
@@ -146,38 +148,19 @@ class Minimap:
         return -h <= mx <= h and -h <= mz <= h
 
     # ------------------------------------------------------------------
-    def update(self, aircraft_east, aircraft_north, heading_deg):
-        # Clear old dynamic content
-        self.content.node().removeAllChildren()
-
-        # Redraw all features relative to current aircraft position
+    def _build_features(self):
+        """Build all map features once at world positions (scaled to map units)."""
         for f in FEATURES:
             if f['type'] == 'line':
-                self._draw_line(f, aircraft_east, aircraft_north)
+                self._build_line(f)
             elif f['type'] == 'circle':
-                self._draw_circle(f, aircraft_east, aircraft_north)
+                self._build_circle(f)
             elif f['type'] == 'rect':
-                self._draw_rect(f, aircraft_east, aircraft_north)
+                self._build_rect(f)
 
-        # Rotate aircraft marker to show heading. Panda2D 'R' rotates
-        # around the axis pointing into the screen. Heading in world:
-        # The marker nose points toward +Z (north). Panda3D's positive R
-        # rotates that vector clockwise on this x/z overlay, matching a
-        # clockwise aviation heading.
-        self.aircraft_marker.setR(heading_deg)
-
-    # ------------------------------------------------------------------
-    def _draw_line(self, f, ae, an):
-        ax, az = self._world_to_map(*f['a'], ae, an)
-        bx, bz = self._world_to_map(*f['b'], ae, an)
-        # Cheap clip: skip if both endpoints are far outside
-        if not (self._in_view(ax, az, 0.05) or self._in_view(bx, bz, 0.05)):
-            # Both off-screen; skip only if same side
-            if (ax < -self.size/2 and bx < -self.size/2) or \
-               (ax >  self.size/2 and bx >  self.size/2) or \
-               (az < -self.size/2 and bz < -self.size/2) or \
-               (az >  self.size/2 and bz >  self.size/2):
-                return
+    def _build_line(self, f):
+        ax, az = f['a'][0] * self.mps, f['a'][1] * self.mps
+        bx, bz = f['b'][0] * self.mps, f['b'][1] * self.mps
         ls = LineSegs()
         ls.setColor(*f['color'])
         ls.setThickness(f.get('width', 1.5))
@@ -185,17 +168,12 @@ class Minimap:
         ls.drawTo(bx, 0, bz)
         self.content.attachNewNode(ls.create())
 
-    def _draw_circle(self, f, ae, an):
-        cx, cz = self._world_to_map(*f['center'], ae, an)
+    def _build_circle(self, f):
+        cx, cz = f['center'][0] * self.mps, f['center'][1] * self.mps
         r = f['r'] * self.mps
-        # Skip if entirely off-screen
-        h = self.size / 2
-        if cx + r < -h or cx - r > h or cz + r < -h or cz - r > h:
-            return
         ls = LineSegs()
         ls.setColor(*f['color'])
         ls.setThickness(1.5)
-        import math
         segments = 20
         for i in range(segments + 1):
             a = 2 * math.pi * i / segments
@@ -207,12 +185,9 @@ class Minimap:
                 ls.drawTo(x, 0, z)
         self.content.attachNewNode(ls.create())
 
-    def _draw_rect(self, f, ae, an):
-        cx, cz = self._world_to_map(*f['center'], ae, an)
+    def _build_rect(self, f):
+        cx, cz = f['center'][0] * self.mps, f['center'][1] * self.mps
         sx, sz = f['sx'] * self.mps / 2, f['sy'] * self.mps / 2
-        h = self.size / 2
-        if cx + sx < -h or cx - sx > h or cz + sz < -h or cz - sz > h:
-            return
         ls = LineSegs()
         ls.setColor(*f['color'])
         ls.setThickness(1.5)
@@ -222,3 +197,12 @@ class Minimap:
         ls.drawTo(cx - sx, 0, cz + sz)
         ls.drawTo(cx - sx, 0, cz - sz)
         self.content.attachNewNode(ls.create())
+
+    # ------------------------------------------------------------------
+    def update(self, aircraft_east, aircraft_north, heading_deg):
+        # Translate pre-built features so aircraft stays centered
+        self.content.setPos(-aircraft_east * self.mps, 0,
+                            -aircraft_north * self.mps)
+
+        # Rotate aircraft marker to show heading
+        self.aircraft_marker.setR(heading_deg)

@@ -2,7 +2,7 @@
 main.py
 -------
 Panda3D app tying together JSBSim physics, procedural A320, EGLL 27L
-scenery, and HUD. Two camera modes: chase (F1) and cockpit-ish (F2).
+scenery, and HUD. Eight camera views (F1-F8), cycled with C.
 
 Run:
     python main.py
@@ -22,18 +22,26 @@ Controls:
     G               gear toggle
     F / V           flaps down / up notch
     Home            reset to threshold
-    F1 / F2         camera: chase / cockpit
-    C               toggle chase / cockpit camera
+    F1              chase camera (smoothed orbit, RMB pan)
+    F2              cockpit camera (fixed forward, g-force shake)
+    F3              passenger left wing view
+    F4              passenger right wing view
+    F5              gear cam (under belly, looking at gear/runway)
+    F6              tail cam (from fin top, forward over fuselage)
+    F7              tower cam (ATC tower, tracks aircraft)
+    F8              top-down camera (+200m above aircraft)
+    C               cycle through all 8 camera views
     Esc             quit
 """
-
 import math
+from math import sin, cos, radians
 import sys
 from night_lighting import (
     create_dynamic_night_lights, update_dynamic_night_lights,
     set_night_mode, apply_night_fog, apply_day_fog,
 )
 
+from scenery import update_rabbit_lights
 from shadow import create_aircraft_shadow, update_aircraft_shadow
 from direct.showbase.ShowBase import ShowBase
 from direct.task import Task
@@ -68,6 +76,12 @@ from audio import AudioSystem
 
 PHYSICS_HZ = 120
 PHYSICS_DT = 1.0 / PHYSICS_HZ
+
+# Camera view order for C-key cycling
+CAMERA_VIEWS = [
+    'chase', 'cockpit', 'pax_left', 'pax_right',
+    'gear', 'tail', 'tower', 'topdown',
+]
 
 
 class Sim(ShowBase):
@@ -117,9 +131,21 @@ class Sim(ShowBase):
             length=3650.0, center_y=1800.0,
             name='northern_runway_lights', prefix='north_',
         ).reparentTo(self.render)
+
+        # Cache light NodePaths once (avoid find() every frame)
+        self.rabbit_cache = [
+            self.render.find(f'**/rabbit_{i}') for i in range(20)
+        ]
+        self.papi_cache = [
+            self.render.find(f'**/papi_{i}') for i in range(4)
+        ]
+        self.north_papi_cache = [
+            self.render.find(f'**/north_papi_{i}') for i in range(4)
+        ]
+
         self._loading_update('Generating Heathrow airport districts...', 0.52)
         build_city().reparentTo(self.render)
-        self.night_pool = create_dynamic_night_lights(self.render, count=6)
+        self.night_pool = create_dynamic_night_lights(self.render, count=12)
         self.city_lights = build_city_lights()
         self.city_lights.reparentTo(self.render)
         self._loading_update('Adding aircraft systems and instruments...', 0.72)
@@ -171,7 +197,7 @@ class Sim(ShowBase):
         self.keys = {}
         for k in ('w', 's', 'a', 'd', 'q', 'e', 'shift', 'control', 'space',
                   'o', 'p', 'g', 'f', 'v', 't', 'r', 'm', 'home',
-                  'escape', 'f1', 'f2', 'c'):
+                  'escape', 'f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8', 'c'):
             self.accept(k,        self._key_down, [k])
             self.accept(k + '-up', self._key_up,   [k])
         # Panda3D emits 'lshift' / 'lcontrol' by default — map both
@@ -261,7 +287,10 @@ class Sim(ShowBase):
         )
         self._setup_label('CAMERA', -1.18, -0.06)
         self.camera_menu = DirectOptionMenu(
-            parent=self.setup_root, items=['CHASE', 'COCKPIT'], initialitem=0,
+            parent=self.setup_root, items=[
+                'CHASE', 'COCKPIT', 'PAX LEFT', 'PAX RIGHT',
+                'GEAR', 'TAIL', 'TOWER', 'TOP DOWN',
+            ], initialitem=0,
             scale=0.045, pos=(-1.18, 0, -0.18),
             frameColor=(0.10, 0.18, 0.20, 1),
             text_fg=(0.85, 0.95, 1, 1),
@@ -322,7 +351,13 @@ class Sim(ShowBase):
         self.current_spawn = spawn_names[self.spawn_menu.get()]
         self.current_weather = weather.copy()
         self._apply_time_of_day(weather['time'])
-        self.camera_mode = 'cockpit' if self.camera_menu.get() == 'COCKPIT' else 'chase'
+        cam_map = {
+            'CHASE': 'chase', 'COCKPIT': 'cockpit',
+            'PAX LEFT': 'pax_left', 'PAX RIGHT': 'pax_right',
+            'GEAR': 'gear', 'TAIL': 'tail',
+            'TOWER': 'tower', 'TOP DOWN': 'topdown',
+        }
+        self.camera_mode = cam_map.get(self.camera_menu.get(), 'chase')
         if self.graphics_menu.get() == 'PERFORMANCE':
             self.render.clearAntialias()
             self.render.getFog().setLinearRange(1200, 18000)
@@ -339,33 +374,83 @@ class Sim(ShowBase):
         self.sim_started = True
 
     def _apply_time_of_day(self, hour):
-        """Set sky, lighting, and golden-hour warmth from the selected hour."""
+        """Set sky colour, sun direction, lighting colour, and fog from hour.
+
+        Uses simplified solar geometry for EGLL latitude (51.5 N).
+        Sun direction is set here — scenery.py no longer hardcodes it.
+        """
+        # --- Solar geometry (simplified) ---
+        lat_rad = math.radians(51.5)  # EGLL latitude
+        # Approximate solar declination for mid-summer (~+23.4 deg)
+        # A proper sim would use the date; we pick a mild 10 deg declination
+        # so the sun is never directly overhead but still gets reasonably high.
+        dec_rad = math.radians(10.0)
+        hour_angle_rad = math.radians((hour - 12.0) * 15.0)  # 15 deg per hour
+
+        sin_elev = (math.sin(lat_rad) * math.sin(dec_rad) +
+                    math.cos(lat_rad) * math.cos(dec_rad) *
+                    math.cos(hour_angle_rad))
+        elevation_deg = math.degrees(math.asin(max(-1.0, min(1.0, sin_elev))))
+
+        # Azimuth (from north, clockwise)
+        cos_elev = math.cos(math.radians(elevation_deg))
+        if cos_elev > 0.001:
+            cos_az = ((math.sin(dec_rad) -
+                        math.sin(lat_rad) * sin_elev) /
+                       (math.cos(lat_rad) * cos_elev))
+            cos_az = max(-1.0, min(1.0, cos_az))
+            azimuth_deg = math.degrees(math.acos(cos_az))
+            if hour_angle_rad > 0:
+                azimuth_deg = 360.0 - azimuth_deg
+        else:
+            azimuth_deg = 180.0  # straight south at zenith
+
+        # Set directional light heading + pitch
+        # Panda3D HPR: H = heading (CW from -Y in our world), P = pitch down
+        sun_heading = azimuth_deg
+        sun_pitch = -max(elevation_deg, -5)  # clamp so light doesn't go underground
+        self.sun_np.setHpr(sun_heading, sun_pitch, 0)
+
+        # --- Daylight / colour ramps ---
         daylight = max(0.0, math.sin((hour - 6.0) / 12.0 * math.pi))
         dawn = max(0.0, 1.0 - abs(hour - 6.5) / 1.7)
         dusk = max(0.0, 1.0 - abs(hour - 17.5) / 1.7)
         golden_hour = max(dawn, dusk) * daylight
+
+        # Enhanced golden hour: deep warm orange when sun elevation < 5 deg
+        low_sun = max(0.0, 1.0 - max(0.0, elevation_deg) / 5.0) if elevation_deg < 5 else 0.0
+        golden = max(golden_hour, low_sun * daylight)
+
         if daylight < 0.08:
             sky = (0.015, 0.025, 0.07)
             fog_color = (0.025, 0.045, 0.10)
-            set_night_mode(self.render, enabled=True, pool=self.night_pool,sun_light_np=self.sun_np, ambient_light_np=self.amb_np)
+            set_night_mode(self.render, enabled=True, pool=self.night_pool,
+                           sun_light_np=self.sun_np, ambient_light_np=self.amb_np)
             apply_night_fog(self.render)
         else:
-            sky = (0.24 + daylight * 0.30 + golden_hour * 0.22,
-                   0.38 + daylight * 0.30 - golden_hour * 0.10,
-                   0.50 + daylight * 0.32 - golden_hour * 0.18)
+            sky = (0.24 + daylight * 0.30 + golden * 0.22,
+                   0.38 + daylight * 0.30 - golden * 0.10,
+                   0.50 + daylight * 0.32 - golden * 0.18)
             fog_color = sky
-            set_night_mode(self.render, enabled=False, pool=self.night_pool,sun_light_np=self.sun_np, ambient_light_np=self.amb_np)
+            set_night_mode(self.render, enabled=False, pool=self.night_pool,
+                           sun_light_np=self.sun_np, ambient_light_np=self.amb_np)
             apply_day_fog(self.render)
         self.setBackgroundColor(*sky)
         self.render.getFog().setColor(*fog_color)
+
+        # Ambient gets warm fill tint during golden hour
         self.amb_np.node().setColor(
-            (0.08 + daylight * 0.32, 0.10 + daylight * 0.32,
-             0.16 + daylight * 0.30, 1)
+            (0.08 + daylight * 0.32 + golden * 0.12,
+             0.10 + daylight * 0.32 + golden * 0.06,
+             0.16 + daylight * 0.30 - golden * 0.08, 1)
         )
+
+        # Sun colour: warm orange at low elevation, neutral white above 30 deg
+        warmth = max(0.0, 1.0 - max(0.0, elevation_deg) / 30.0)
         self.sun_np.node().setColor(
-            (0.12 + daylight * 0.83,
-             0.16 + daylight * 0.72 - golden_hour * 0.20,
-             0.25 + daylight * 0.55 - golden_hour * 0.35, 1)
+            (0.12 + daylight * 0.83 + warmth * 0.05,
+             0.16 + daylight * 0.72 - warmth * 0.20,
+             0.25 + daylight * 0.55 - warmth * 0.35, 1)
         )
 
     # ------------------------------------------------------------------
@@ -408,15 +493,30 @@ class Sim(ShowBase):
             self.mouse_yoke = not self.mouse_yoke
         elif k == 'f1':
             self.camera_mode = 'chase'
-            self.cam_pan_yaw_deg = 0.0        # <-- add these two lines
+            self.cam_pan_yaw_deg = 0.0
             self.cam_pan_pitch_deg = 0.0
-            self._cam_lookat_pos = None   # <-- add this so it re-captures
+            self._cam_lookat_pos = None
         elif k == 'f2':
             self.camera_mode = 'cockpit'
+        elif k == 'f3':
+            self.camera_mode = 'pax_left'
+        elif k == 'f4':
+            self.camera_mode = 'pax_right'
+        elif k == 'f5':
+            self.camera_mode = 'gear'
+        elif k == 'f6':
+            self.camera_mode = 'tail'
+        elif k == 'f7':
+            self.camera_mode = 'tower'
+        elif k == 'f8':
+            self.camera_mode = 'topdown'
         elif k == 'c':
-            self.camera_mode = (
-                'cockpit' if self.camera_mode == 'chase' else 'chase'
-            )
+            idx = CAMERA_VIEWS.index(self.camera_mode) if self.camera_mode in CAMERA_VIEWS else -1
+            self.camera_mode = CAMERA_VIEWS[(idx + 1) % len(CAMERA_VIEWS)]
+            if self.camera_mode == 'chase':
+                self.cam_pan_yaw_deg = 0.0
+                self.cam_pan_pitch_deg = 0.0
+                self._cam_lookat_pos = None
         elif k == 'r' and not was_down:
             self.fd.reverser = not self.fd.reverser
 
@@ -452,8 +552,6 @@ class Sim(ShowBase):
         Mouse RIGHT = right roll = positive aileron. Aileron = mouseX.
         """
         if self.rmb_held:
-            return None, None
-        if not self.mouseWatcherNode.hasMouse():
             return None, None
         if not self.mouseWatcherNode.hasMouse():
             return None, None
@@ -566,25 +664,26 @@ class Sim(ShowBase):
         if not self.n_flap_r.isEmpty():
             self.n_flap_r.setP(flap_deg)
 
-        # Spoilers: pitch upward with speedbrake command (0..50°)
-        sp_deg = self.fd.speedbrake * 50.0
+        # Spoilers: pivot at forward/bottom edge, negative P lifts aft edge up
+        sp_deg = self.fd.speedbrake * -50.0
         for n in self.n_spoilers:
             if not n.isEmpty():
                 n.setP(sp_deg)
 
-        # Gear: hide when up (simple placeholder — real animation is a big job)
-        vis = self.fd.gear_down
-        for n in (self.n_gear_nose, self.n_gear_l, self.n_gear_r):
-            if n.isEmpty():
-                continue
-            if vis:
-                n.show()
-            else:
-                n.hide()
+        # Gear: smooth retraction animation driven by JSBSim gear-pos-norm.
+        # Always visible — rotation handles the visual.
+        gear_pos = self.fd.gear_position_norm()  # 1.0 = down, 0.0 = up
         if not self.n_gear_nose.isEmpty():
-            self.n_gear_nose.setH(
-                -self.fd.rudder * 25 if self.fd.on_ground() else 0
-            )
+            # Nose gear rotates forward (pitch) into belly
+            nose_retract = (1.0 - gear_pos) * -90
+            steer_h = -self.fd.rudder * 25 if self.fd.on_ground() else 0
+            self.n_gear_nose.setHpr(steer_h, nose_retract, 0)
+        if not self.n_gear_l.isEmpty():
+            # Left main gear folds inward (positive roll)
+            self.n_gear_l.setR((1.0 - gear_pos) * 90)
+        if not self.n_gear_r.isEmpty():
+            # Right main gear folds inward (negative roll)
+            self.n_gear_r.setR((1.0 - gear_pos) * -90)
 
     def _update_camera(self,dt):
         forward_g, lateral_g, vertical_g = self.fd.body_acceleration_g()
@@ -614,9 +713,7 @@ class Sim(ShowBase):
         self.camera_motion_hpr += (target_hpr - self.camera_motion_hpr) * blend
 
         if self.camera_mode == 'chase':
-            from math import sin, cos, radians
-
-            # --- Compute the "ideal" camera position (where it would sit without smoothing)
+            # --- Smoothed orbit chase camera with RMB pan
             base_dist = 50.0
             base_height = 12.0
 
@@ -632,10 +729,7 @@ class Sim(ShowBase):
             target_cam_y = self.plane.getY() + cos(total_yaw) * horiz_dist
             target_cam_z = self.plane.getZ() + vert_offset
 
-            # --- Smooth the camera position toward the target
-            # Higher smoothing_factor = camera catches up faster (less lag)
-            # Lower = more lag, more stable-feeling
-            pos_smoothing = 3.5   # ~0.3 sec time constant
+            pos_smoothing = 3.5
             alpha = min(1.0, dt * pos_smoothing)
 
             current = self.camera.getPos()
@@ -644,14 +738,11 @@ class Sim(ShowBase):
             new_z = current.z + (target_cam_z - current.z) * alpha
             self.camera.setPos(new_x, new_y, new_z)
 
-            # --- Smoothed aim point
-            # Camera looks at a lagged version of the aircraft position, so
-            # pitch/roll oscillations don't jerk the view around.
             if self._cam_lookat_pos is None:
                 self._cam_lookat_pos = self.plane.getPos() + Vec3(0, 0, 3)
 
             target_lookat = self.plane.getPos() + Vec3(0, 0, 3)
-            lookat_smoothing = 4.5   # aim smoothing slightly faster than position
+            lookat_smoothing = 4.5
             beta = min(1.0, dt * lookat_smoothing)
 
             lx = self._cam_lookat_pos.x + (target_lookat.x - self._cam_lookat_pos.x) * beta
@@ -660,13 +751,57 @@ class Sim(ShowBase):
             self._cam_lookat_pos = Vec3(lx, ly, lz)
 
             self.camera.lookAt(self._cam_lookat_pos)
-        else:  # cockpit-ish: at nose, looking forward with plane
+
+        elif self.camera_mode == 'cockpit':
+            # Fixed forward with g-force shake
             fwd_offset = self.plane.getQuat().xform(Vec3(0, 16.5, 2.5))
             motion = self.plane.getQuat().xform(self.camera_motion)
             self.camera.setPos(self.plane.getPos() + fwd_offset + motion)
             self.camera.setHpr(self.plane.getHpr() + self.camera_motion_hpr)
-            # Nudge pitch down a touch so horizon sits naturally
             self.camera.setP(self.camera.getP() - 3)
+
+        elif self.camera_mode == 'pax_left':
+            # Passenger left window, looking out toward left wing
+            offset = self.plane.getQuat().xform(Vec3(-1.6, 2.0, 0.8))
+            motion = self.plane.getQuat().xform(self.camera_motion)
+            self.camera.setPos(self.plane.getPos() + offset + motion)
+            self.camera.setHpr(self.plane.getHpr() + self.camera_motion_hpr)
+            self.camera.setH(self.camera.getH() + 90)  # look left
+
+        elif self.camera_mode == 'pax_right':
+            # Passenger right window, looking out toward right wing
+            offset = self.plane.getQuat().xform(Vec3(1.6, 2.0, 0.8))
+            motion = self.plane.getQuat().xform(self.camera_motion)
+            self.camera.setPos(self.plane.getPos() + offset + motion)
+            self.camera.setHpr(self.plane.getHpr() + self.camera_motion_hpr)
+            self.camera.setH(self.camera.getH() - 90)  # look right
+
+        elif self.camera_mode == 'gear':
+            # Under belly, looking down at gear/runway
+            offset = self.plane.getQuat().xform(Vec3(0, -1, -4))
+            motion = self.plane.getQuat().xform(self.camera_motion)
+            self.camera.setPos(self.plane.getPos() + offset + motion)
+            self.camera.setHpr(self.plane.getHpr() + self.camera_motion_hpr)
+            self.camera.setP(self.camera.getP() - 45)  # tilt down toward runway
+
+        elif self.camera_mode == 'tail':
+            # From fin top, forward over fuselage
+            offset = self.plane.getQuat().xform(Vec3(0, -17, 7.5))
+            motion = self.plane.getQuat().xform(self.camera_motion)
+            self.camera.setPos(self.plane.getPos() + offset + motion)
+            self.camera.setHpr(self.plane.getHpr() + self.camera_motion_hpr)
+            self.camera.setP(self.camera.getP() - 8)  # slight downward tilt
+
+        elif self.camera_mode == 'tower':
+            # ATC tower — world-fixed position, tracks aircraft
+            self.camera.setPos(-800, 250, 55)
+            self.camera.lookAt(self.plane.getPos() + Vec3(0, 0, 2))
+
+        elif self.camera_mode == 'topdown':
+            # Overhead, heading-aligned, 200m above aircraft
+            pos = self.plane.getPos()
+            self.camera.setPos(pos.x, pos.y, pos.z + 200)
+            self.camera.setHpr(self.plane.getH(), -90, 0)  # straight down
             
     def _update_camera_pan(self):
         if not self.rmb_held or not self.mouseWatcherNode.hasMouse():
@@ -750,14 +885,13 @@ class Sim(ShowBase):
         self._update_camera(dt)
         self.audio.update(self.fd)
         update_dynamic_night_lights(self.night_pool, self.plane.getPos())
-
-
+        
+        update_rabbit_lights(self.rabbit_cache, globalClock.getRealTime())
 
         # PAPI needs aircraft east + altitude in world coords
         pos = self.plane.getPos()
-        update_papi(self.render, pos.x, pos.z)
-        update_papi(self.render, pos.x, pos.z, center_y=1800.0,
-                prefix='north_')
+        update_papi(self.papi_cache, pos.x, pos.z)
+        update_papi(self.north_papi_cache, pos.x, pos.z, center_y=1800.0)
 
         self.hud.update(
             self.fd,
@@ -765,10 +899,8 @@ class Sim(ShowBase):
             self.fd.wheel_brake,
             self.fd.parking_brake,
             mouse_yoke=self.mouse_yoke,
+            camera_mode=self.camera_mode,
         )
-        # Minimap: aircraft east/north come from local ENU already computed
-        east, north, _ = self.fd.local_position_enu()
-
         east, north, up = self.fd.local_position_enu()
         update_aircraft_shadow(self.shadow, east, north, up, self.fd.heading_deg())
         self.minimap.update(east, north, self.fd.heading_deg())

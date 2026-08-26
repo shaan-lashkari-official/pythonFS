@@ -1,10 +1,10 @@
 """
 plane_model.py
 --------------
-Procedural A320-ish model built from primitive geometry. Not pretty, but
-proportional and clearly an airliner. Replace with a proper Blender model
-later — just swap build_a320() with loader.loadModel('a320.gltf') and keep
-the same NodePath structure.
+A320 aircraft model. When a320_hd.glb is present, uses the HD mesh for
+fuselage/wings/engines and adds procedural animated surfaces (ailerons,
+flaps, spoilers, rudder, elevators) and landing gear on top.
+Falls back to a fully procedural model if the glb is missing.
 
 Real A320-200 dimensions used:
   length      37.6 m
@@ -14,6 +14,7 @@ Real A320-200 dimensions used:
   engines     2 x CFM56 under wings
 """
 
+import os
 from panda3d.core import (
     Geom, GeomNode, GeomVertexData, GeomVertexFormat, GeomVertexWriter,
     GeomTriangles, NodePath, Vec3, Vec4, Point3, LVector3,
@@ -159,18 +160,212 @@ TAIL_COLOR     = (0.15, 0.30, 0.60, 1)   # blue tail (generic livery)
 ENGINE_COLOR   = (0.85, 0.85, 0.88, 1)
 GEAR_COLOR     = (0.25, 0.25, 0.27, 1)
 CONTROL_COLOR  = (0.80, 0.80, 0.82, 1)
+SURFACE_COLOR  = (0.72, 0.72, 0.74, 1)   # slightly darker for HD surfaces
+GEAR_BAY_COLOR = (0.18, 0.18, 0.20, 1)   # dark gear bay fairings
+
+
+def _build_gear(name, x, y, z, leg_len=2.5, main=False):
+    """Build a landing-gear strut with wheels, positioned at (x, y, z)."""
+    gear = NodePath(name)
+    leg = _make_cylinder_geom(0.15, leg_len, segments=8,
+                              color=GEAR_COLOR, axis='z')
+    leg.setZ(-leg_len / 2)
+    leg.reparentTo(gear)
+
+    wheel_positions = (
+        ((-0.28, 0.0), (0.28, 0.0)) if not main else
+        ((-0.42, -0.58), (0.42, -0.58),
+         (-0.42, 0.58), (0.42, 0.58))
+    )
+    for wheel_x, wheel_y in wheel_positions:
+        wheel = _make_cylinder_geom(0.5, 0.28, segments=12,
+                                    color=(0.1, 0.1, 0.1, 1), axis='x')
+        wheel.setPos(wheel_x, wheel_y, -leg_len)
+        wheel.reparentTo(gear)
+
+    if main:
+        bogie = _make_box_geom(0.18, 1.7, 0.18, color=GEAR_COLOR)
+        bogie.setZ(-leg_len + 0.05)
+        bogie.reparentTo(gear)
+    gear.setPos(x, y, z)
+    return gear
+
+
+def _load_glb_body():
+    """Try to load a320_hd.glb, orient and centre it. Returns NodePath or None."""
+    glb_path = os.path.join(os.path.dirname(__file__), 'a320_hd.glb')
+    if not os.path.isfile(glb_path):
+        return None
+    try:
+        from panda3d.core import Loader, Filename, LoaderOptions
+        ldr = Loader.getGlobalPtr()
+        node = ldr.loadSync(Filename.fromOsSpecific(glb_path), LoaderOptions())
+        if node is None:
+            return None
+        model = NodePath(node)
+        model.setHpr(0, 90, -90)  # glTF Y-up → our Y-fwd / Z-up
+
+        # Wrap in a centering node so the model origin sits at body centre
+        wrapper = NodePath('glb_body')
+        model.reparentTo(wrapper)
+        bounds = wrapper.getTightBounds()
+        if bounds:
+            lo, hi = bounds
+            model.setPos(model.getX() - (lo.x + hi.x) / 2,
+                         model.getY() - (lo.y + hi.y) / 2,
+                         model.getZ() - (lo.z + hi.z) / 2)
+        return wrapper
+    except Exception:
+        return None
+
+
+def _add_animated_surfaces(plane):
+    """Add procedural animated control surfaces with proper pivot nodes.
+
+    Each surface gets a **pivot NodePath** at the hinge line.  The box
+    geometry is attached as a child, offset so the hinge edge sits at
+    the pivot origin.  When main.py calls ``setP``/``setR``/``setH`` on
+    the found node (the pivot), the surface rotates around the hinge
+    instead of around its geometric centre.
+
+    All coordinates derived from vertex-level probing of the centred/
+    oriented a320_hd.glb mesh.
+    """
+
+    THICKNESS = 0.06   # thinner than before for a less blocky look
+
+    # --- Ailerons (X ≈ 11–15, trailing edge) --------------------------
+    # Sweep: trailing edge sweeps ~17 deg on the outer wing
+    for side_sign in (-1, 1):
+        side = 'right' if side_sign > 0 else 'left'
+        chord = 0.8
+        pivot = NodePath(f'aileron_{side}')
+        pivot.setX(side_sign * 13.0)
+        pivot.setY(-2.35 + chord / 2)       # forward (hinge) edge
+        pivot.setZ(-2.15)                    # flush with wing surface
+        pivot.setH(side_sign * -17)          # trailing-edge sweep
+        pivot.reparentTo(plane)
+        geom = _make_box_geom(4.0, chord, THICKNESS, color=SURFACE_COLOR)
+        geom.setY(-chord / 2)               # offset so hinge edge at pivot
+        geom.reparentTo(pivot)
+
+    # --- Flaps (X ≈ 3–9, trailing edge) -------------------------------
+    for side_sign in (-1, 1):
+        side = 'right' if side_sign > 0 else 'left'
+        chord = 1.0
+        pivot = NodePath(f'flap_{side}')
+        pivot.setX(side_sign * 6.0)
+        pivot.setY(-0.35 + chord / 2)       # forward (hinge) edge
+        pivot.setZ(-2.73)                    # wing surface at X=6
+        pivot.setH(side_sign * -5)           # slight inboard sweep
+        pivot.reparentTo(plane)
+        geom = _make_box_geom(5.5, chord, THICKNESS, color=SURFACE_COLOR)
+        geom.setY(-chord / 2)
+        geom.reparentTo(pivot)
+
+    # --- Spoilers (on top of wing) ------------------------------------
+    # Pivot at forward/bottom edge on the wing top surface.
+    for side_sign in (-1, 1):
+        side = 'right' if side_sign > 0 else 'left'
+        chord = 1.2
+
+        # Inner spoiler at X ≈ 8
+        pivot1 = NodePath(f'spoiler_{side}_1')
+        pivot1.setX(side_sign * 8.0)
+        pivot1.setY(1.55 + chord / 2)       # forward edge
+        pivot1.setZ(-2.57)                   # wing top surface
+        pivot1.setH(side_sign * -10)
+        pivot1.reparentTo(plane)
+        geom1 = _make_box_geom(3.0, chord, THICKNESS, color=SURFACE_COLOR)
+        geom1.setY(-chord / 2)
+        geom1.setZ(THICKNESS / 2)           # bottom edge at pivot Z
+        geom1.reparentTo(pivot1)
+
+        # Outer spoiler at X ≈ 12
+        pivot2 = NodePath(f'spoiler_{side}_2')
+        pivot2.setX(side_sign * 12.0)
+        pivot2.setY(-0.17 + chord / 2)      # forward edge
+        pivot2.setZ(-2.23)                   # wing top surface
+        pivot2.setH(side_sign * -17)
+        pivot2.reparentTo(plane)
+        geom2 = _make_box_geom(3.0, chord, THICKNESS, color=SURFACE_COLOR)
+        geom2.setY(-chord / 2)
+        geom2.setZ(THICKNESS / 2)
+        geom2.reparentTo(pivot2)
+
+    # --- Rudder (aft edge of vertical fin) ----------------------------
+    # Hinge at forward edge where fin meets rudder.
+    chord_r = 1.2
+    pivot_r = NodePath('rudder')
+    pivot_r.setY(-17.5 + chord_r / 2)       # forward (hinge) edge
+    pivot_r.setZ(2.2)                        # fin mid-height
+    pivot_r.reparentTo(plane)
+    geom_r = _make_box_geom(0.25, chord_r, 5.0, color=SURFACE_COLOR)
+    geom_r.setY(-chord_r / 2)               # box extends aft from hinge
+    geom_r.reparentTo(pivot_r)
+
+    # --- Elevators (trailing edge of horizontal stab) -----------------
+    for side_sign in (-1, 1):
+        side = 'right' if side_sign > 0 else 'left'
+        chord_e = 0.8
+        pivot_e = NodePath(f'elevator_{side}')
+        pivot_e.setX(side_sign * 4.0)
+        pivot_e.setY(-18.0 + chord_e / 2)   # forward (hinge) edge
+        pivot_e.setZ(-1.15)                  # stab surface level
+        pivot_e.setH(side_sign * -5)         # slight sweep
+        pivot_e.reparentTo(plane)
+        geom_e = _make_box_geom(5.0, chord_e, THICKNESS, color=SURFACE_COLOR)
+        geom_e.setY(-chord_e / 2)
+        geom_e.reparentTo(pivot_e)
 
 
 def build_a320():
     """
-    Returns a NodePath rooted at the aircraft body center.
+    Returns a NodePath rooted at the aircraft body centre.
+    Uses a320_hd.glb for the body when available, with procedural animated
+    surfaces added on top.  Falls back to fully procedural geometry.
     In Panda3D convention: +Y = forward (nose), +X = right wing, +Z = up.
     Named sub-nodes for animation:
       .find('**/gear_nose'), .find('**/gear_left'), .find('**/gear_right')
       .find('**/aileron_left'), .find('**/aileron_right')
-    .find('**/elevator_left'), .find('**/elevator_right'),
-    .find('**/rudder'), .find('**/flap_left'), .find('**/flap_right')
+      .find('**/elevator_left'), .find('**/elevator_right'),
+      .find('**/rudder'), .find('**/flap_left'), .find('**/flap_right')
     """
+
+    # ------------------------------------------------------------------
+    # Path A: HD glb body + procedural animated parts
+    # ------------------------------------------------------------------
+    glb = _load_glb_body()
+    if glb is not None:
+        plane = NodePath('a320')
+        glb.reparentTo(plane)
+
+        _add_animated_surfaces(plane)
+
+        # Gear bay fairings — dark recesses on the belly so gear
+        # struts look connected to the fuselage, not floating.
+        nose_bay = _make_box_geom(1.2, 2.0, 0.3, color=GEAR_BAY_COLOR)
+        nose_bay.setPos(0, 14.0, -4.5)
+        nose_bay.reparentTo(plane)
+
+        for bay_sign in (-1, 1):
+            main_bay = _make_box_geom(1.8, 2.4, 0.3, color=GEAR_BAY_COLOR)
+            main_bay.setPos(bay_sign * 3.5, -1.0, -4.5)
+            main_bay.reparentTo(plane)
+
+        # Landing gear — fuselage belly is at Z ≈ -4.55
+        _build_gear('gear_nose',  0.0,  14.0, -4.5, leg_len=2.2
+                    ).reparentTo(plane)
+        _build_gear('gear_left', -3.5,  -1.0, -4.5, leg_len=2.2, main=True
+                    ).reparentTo(plane)
+        _build_gear('gear_right', 3.5,  -1.0, -4.5, leg_len=2.2, main=True
+                    ).reparentTo(plane)
+
+        return plane
+
+    # ------------------------------------------------------------------
+    # Path B: fully procedural fallback
+    # ------------------------------------------------------------------
     plane = NodePath('a320')
 
     # --- Fuselage: rounded center section with tapered nose and tail
@@ -190,53 +385,43 @@ def build_a320():
     tailcone.setY(-16.3)
     tailcone.reparentTo(plane)
 
-    # --- Main wings: use two swept boxes (one per side).
-    # Panda3D lacks skewed primitives, so we approximate sweep by rotating
-    # a thin box slightly around Z and offsetting.
+    # --- Main wings
     def build_wing(side_sign):
-        """side_sign = +1 for right wing, -1 for left."""
         wing_root = NodePath('wing_root')
-        # Wing: 15m long (half-span minus fuselage), 4m chord, 0.4m thick
         wing = _make_box_geom(15.0, 4.0, 0.4, color=WING_COLOR)
-        # Position so root is at fuselage side, extending outward
-        wing.setX(side_sign * (2.0 + 7.5))     # 2m fuselage + 7.5m to wing mid
-        wing.setY(-1.0)                         # slightly aft of CG
-        wing.setZ(-1.0)                         # under-fuselage low wing
-        # Sweep: rotate around Z so leading edge sweeps back
+        wing.setX(side_sign * (2.0 + 7.5))
+        wing.setY(-1.0)
+        wing.setZ(-1.0)
         wing.setH(side_sign * -25)
         wing.reparentTo(wing_root)
 
-        # Aileron: small box near wingtip, on trailing edge
+        side = 'right' if side_sign > 0 else 'left'
+
         aileron = _make_box_geom(3.0, 0.8, 0.15, color=CONTROL_COLOR)
-        aileron.setName(f'aileron_{"right" if side_sign > 0 else "left"}')
+        aileron.setName(f'aileron_{side}')
         aileron.setX(side_sign * (2.0 + 12.5))
         aileron.setY(-1.0 - 5.0 * math.sin(math.radians(25)))
         aileron.setZ(-0.9)
         aileron.setH(side_sign * -25)
         aileron.reparentTo(wing_root)
 
-        # Flap: inboard trailing edge
         flap = _make_box_geom(6.0, 1.2, 0.15, color=CONTROL_COLOR)
-        flap.setName(f'flap_{"right" if side_sign > 0 else "left"}')
+        flap.setName(f'flap_{side}')
         flap.setX(side_sign * (2.0 + 5.5))
         flap.setY(-3.2)
         flap.setZ(-1.0)
         flap.setH(side_sign * -25)
         flap.reparentTo(wing_root)
 
-        # Spoiler panels on TOP of the wing (deploy upward for speedbrake).
-        # Real A320 has 5 panels per wing — we do 2 per side for the model.
-        side_name = "right" if side_sign > 0 else "left"
         for i, x_off in enumerate((7.0, 11.0)):
             sp = _make_box_geom(3.0, 1.5, 0.1, color=CONTROL_COLOR)
-            sp.setName(f'spoiler_{side_name}_{i+1}')
+            sp.setName(f'spoiler_{side}_{i+1}')
             sp.setX(side_sign * (2.0 + x_off))
             sp.setY(-2.0)
-            sp.setZ(-0.75)      # top surface of the wing
+            sp.setZ(-0.75)
             sp.setH(side_sign * -25)
             sp.reparentTo(wing_root)
 
-        # Engine nacelle: cylinder under wing, forward of leading edge
         engine = _make_cylinder_geom(1.3, 4.5, segments=16,
                                      color=ENGINE_COLOR, axis='y')
         engine.setX(side_sign * 6.0)
@@ -244,21 +429,19 @@ def build_a320():
         engine.setZ(-2.5)
         engine.reparentTo(wing_root)
 
-        # Dark intake and exhaust faces make the CFM56 nacelles readable.
         intake = _make_cylinder_geom(1.12, 0.12, segments=20,
-                         color=(0.06, 0.07, 0.09, 1), axis='y')
+                                     color=(0.06, 0.07, 0.09, 1), axis='y')
         intake.setX(side_sign * 6.0)
         intake.setY(3.28)
         intake.setZ(-2.5)
         intake.reparentTo(wing_root)
         exhaust = _make_cylinder_geom(0.78, 0.12, segments=16,
-                          color=(0.12, 0.12, 0.14, 1), axis='y')
+                                      color=(0.12, 0.12, 0.14, 1), axis='y')
         exhaust.setX(side_sign * 6.0)
         exhaust.setY(-1.28)
         exhaust.setZ(-2.5)
         exhaust.reparentTo(wing_root)
 
-        # Blended winglet, a distinctive A320 family silhouette.
         winglet = _make_box_geom(0.18, 1.8, 2.2, color=WING_COLOR)
         winglet.setX(side_sign * 17.35)
         winglet.setY(-1.0 - 7.5 * math.sin(math.radians(25)))
@@ -266,7 +449,6 @@ def build_a320():
         winglet.setH(side_sign * -25)
         winglet.reparentTo(wing_root)
 
-        # Pylon connecting engine to wing
         pylon = _make_box_geom(0.4, 2.0, 1.5, color=WING_COLOR)
         pylon.setX(side_sign * 6.0)
         pylon.setY(0.5)
@@ -278,20 +460,17 @@ def build_a320():
     build_wing(+1).reparentTo(plane)
     build_wing(-1).reparentTo(plane)
 
-    # --- Vertical stabilizer (tail fin)
     vstab = _make_box_geom(0.5, 4.0, 5.5, color=TAIL_COLOR)
     vstab.setY(-15.0)
     vstab.setZ(3.5)
     vstab.reparentTo(plane)
 
-    # Rudder
     rudder = _make_box_geom(0.4, 1.2, 4.5, color=CONTROL_COLOR)
     rudder.setName('rudder')
     rudder.setY(-17.0)
     rudder.setZ(3.5)
     rudder.reparentTo(plane)
 
-    # --- Horizontal stabilizers
     hstab_left = _make_box_geom(6.0, 2.5, 0.3, color=WING_COLOR)
     hstab_left.setX(-3.5)
     hstab_left.setY(-16.0)
@@ -306,7 +485,6 @@ def build_a320():
     hstab_right.setH(15)
     hstab_right.reparentTo(plane)
 
-    # Separate left and right elevators, each aligned with its stabilizer.
     for side_sign in (-1, 1):
         elevator = _make_box_geom(5.5, 0.8, 0.2, color=CONTROL_COLOR)
         elevator.setName(f'elevator_{"right" if side_sign > 0 else "left"}')
@@ -316,38 +494,10 @@ def build_a320():
         elevator.setH(side_sign * 15)
         elevator.reparentTo(plane)
 
-    # --- Landing gear
-    def build_gear(name, x, y, z, leg_len=2.5, main=False):
-        gear = NodePath(name)
-        leg = _make_cylinder_geom(0.15, leg_len, segments=8,
-                                  color=GEAR_COLOR, axis='z')
-        leg.setZ(-leg_len / 2)
-        leg.reparentTo(gear)
+    _build_gear('gear_nose',  0.0,  14.0, -2.0).reparentTo(plane)
+    _build_gear('gear_left', -3.5,  -1.0, -2.0, main=True).reparentTo(plane)
+    _build_gear('gear_right', 3.5,  -1.0, -2.0, main=True).reparentTo(plane)
 
-        # A320 nose gear has two wheels; each main bogie has four wheels.
-        wheel_positions = (
-            ((-0.28, 0.0), (0.28, 0.0)) if not main else
-            ((-0.42, -0.58), (0.42, -0.58),
-             (-0.42, 0.58), (0.42, 0.58))
-        )
-        for wheel_x, wheel_y in wheel_positions:
-            wheel = _make_cylinder_geom(0.5, 0.28, segments=12,
-                                        color=(0.1, 0.1, 0.1, 1), axis='x')
-            wheel.setPos(wheel_x, wheel_y, -leg_len)
-            wheel.reparentTo(gear)
-
-        if main:
-            bogie = _make_box_geom(0.18, 1.7, 0.18, color=GEAR_COLOR)
-            bogie.setZ(-leg_len + 0.05)
-            bogie.reparentTo(gear)
-        gear.setPos(x, y, z)
-        return gear
-
-    build_gear('gear_nose',  0.0,  14.0, -2.0).reparentTo(plane)
-    build_gear('gear_left', -3.5,  -1.0, -2.0, main=True).reparentTo(plane)
-    build_gear('gear_right', 3.5,  -1.0, -2.0, main=True).reparentTo(plane)
-
-    # Cockpit windshield panes, placed on both sides of the tapered nose.
     window_color = (0.04, 0.10, 0.18, 1)
     for side_sign in (-1, 1):
         for y, z, length in ((14.7, 1.05, 1.0), (15.8, 1.2, 0.7)):
