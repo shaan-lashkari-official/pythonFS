@@ -658,3 +658,30 @@ class FlightDynamics:
             float(self.fdm['accelerations/Ny']),
             float(self.fdm['accelerations/Nz']),
         )
+
+    def mach_number(self):
+        try:
+            return float(self.fdm['velocities/mach'])
+        except (KeyError, Exception):
+            return self.airspeed_kt() / 661.5
+
+    def alpha_deg(self):
+        return self._get_alpha_deg()
+
+    def fuel_lbs(self):
+        try:
+            t0 = float(self.fdm['propulsion/tank[0]/contents-lbs'])
+            t1 = float(self.fdm['propulsion/tank[1]/contents-lbs'])
+            return t0 + t1
+        except (KeyError, Exception):
+            return 0.0
+
+    def n1_percent_both(self):
+        """Returns (eng1_n1, eng2_n1)."""
+        try:
+            n1_1 = float(self.fdm['propulsion/engine[0]/n1'])
+            n1_2 = float(self.fdm['propulsion/engine[1]/n1'])
+            return n1_1, n1_2
+        except (KeyError, Exception):
+            pct = self.throttle * 100.0
+            return pct, pct

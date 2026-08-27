@@ -11,7 +11,13 @@
       "Bash(glow:*)",
       "Bash(light:*)",
       "Bash(effect \")",
-      "WebFetch(domain:www.airlinerspotter.com)"
+      "WebFetch(domain:www.airlinerspotter.com)",
+      "Bash(gh api:*)",
+      "Bash(where:*)",
+      "WebFetch(domain:api.github.com)",
+      "Bash(git status:*)",
+      "Bash(python3:*)",
+      "Bash(/d/Shaan/panda3d_FS/analyze_model.py:*)"
     ]
   }
 }

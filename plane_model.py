@@ -1,10 +1,10 @@
 """
 plane_model.py
 --------------
-A320 aircraft model. When a320_hd.glb is present, uses the HD mesh for
-fuselage/wings/engines and adds procedural animated surfaces (ailerons,
-flaps, spoilers, rudder, elevators) and landing gear on top.
-Falls back to a fully procedural model if the glb is missing.
+A320 aircraft model. When a320_cockpit_2.glb is present, uses the detailed
+mesh (fuselage, wings, engines, cockpit interior, landing gear) and adds
+procedural animated control surfaces (ailerons, flaps, spoilers, rudder,
+elevators) on top. Falls back to a fully procedural model if the glb is missing.
 
 Real A320-200 dimensions used:
   length      37.6 m
@@ -250,8 +250,8 @@ def _build_gear(name, x, y, z, leg_len=2.5, main=False):
 
 
 def _load_glb_body():
-    """Try to load a320_hd.glb, orient and centre it. Returns NodePath or None."""
-    glb_path = os.path.join(os.path.dirname(__file__), 'a320_hd.glb')
+    """Load a320_cockpit_2.glb, scale and centre it. Returns NodePath or None."""
+    glb_path = os.path.join(os.path.dirname(__file__), 'a320_cockpit_2.glb')
     if not os.path.isfile(glb_path):
         return None
     try:
@@ -261,90 +261,92 @@ def _load_glb_body():
         if node is None:
             return None
         model = NodePath(node)
-        model.setHpr(0, 90, -90)  # glTF Y-up → our Y-fwd / Z-up
+        # Model is already Z-up — no HPR rotation needed.
 
-        # Wrap in a centering node so the model origin sits at body centre
         wrapper = NodePath('glb_body')
         model.reparentTo(wrapper)
         bounds = wrapper.getTightBounds()
         if bounds:
             lo, hi = bounds
-            model.setPos(model.getX() - (lo.x + hi.x) / 2,
-                         model.getY() - (lo.y + hi.y) / 2,
-                         model.getZ() - (lo.z + hi.z) / 2)
+            # Centre X and Y; leave Z at raw position so the cockpit
+            # sits at Z ≈ 0.7 after scaling (matching camera eye height).
+            model.setPos(-(lo.x + hi.x) / 2,
+                         -(lo.y + hi.y) / 2,
+                         0)
+            # Scale to match old model's fuselage length (~37.67 units)
+            raw_len = max(hi.y - lo.y, 0.01)
+            wrapper.setScale(37.67 / raw_len)
         return wrapper
     except Exception:
         return None
 
 
 def _add_animated_surfaces(plane):
-    """Add procedural animated control surfaces with proper pivot nodes.
+    """Add procedural animated control surfaces matched to a320_cockpit_2.glb.
 
     Each surface gets a **pivot NodePath** at the hinge line.  The box
     geometry is attached as a child, offset so the hinge edge sits at
-    the pivot origin.  When main.py calls ``setP``/``setR``/``setH`` on
-    the found node (the pivot), the surface rotates around the hinge
-    instead of around its geometric centre.
-
-    All coordinates derived from vertex-level probing of the centred/
-    oriented a320_hd.glb mesh.
+    the pivot origin.  Coordinates derived from vertex-level analysis
+    of the centred/scaled a320_cockpit_2.glb mesh.
     """
 
-    THICKNESS = 0.06   # thinner than before for a less blocky look
+    THICKNESS = 0.05   # thin overlay
 
-    # --- Ailerons (X ≈ 11–15, trailing edge) --------------------------
-    # Sweep: trailing edge sweeps ~17 deg on the outer wing
+    # --- Ailerons (outer wing trailing edge, X ≈ 11–16) ---------------
+    # Trailing edge sweep ≈ 21° in this region.
+    # Wing Z follows dihedral: Z ≈ 0.03 @X=11, Z ≈ 0.47 @X=16
     for side_sign in (-1, 1):
         side = 'right' if side_sign > 0 else 'left'
-        chord = 0.8
+        chord = 0.7
         pivot = NodePath(f'aileron_{side}')
-        pivot.setX(side_sign * 13.0)
-        pivot.setY(-2.35 + chord / 2)       # forward (hinge) edge
-        pivot.setZ(-2.15)                    # flush with wing surface
-        pivot.setH(side_sign * -17)          # trailing-edge sweep
+        pivot.setX(side_sign * 13.5)
+        pivot.setY(-2.0)                     # hinge (forward edge)
+        pivot.setZ(0.15)                     # wing surface Z @X=13.5
+        pivot.setH(side_sign * -21)          # trailing-edge sweep
         pivot.reparentTo(plane)
-        geom = _make_box_geom(4.0, chord, THICKNESS, color=SURFACE_COLOR)
-        geom.setY(-chord / 2)               # offset so hinge edge at pivot
+        geom = _make_box_geom(4.5, chord, THICKNESS, color=SURFACE_COLOR)
+        geom.setY(-chord / 2)
         geom.reparentTo(pivot)
 
-    # --- Flaps (X ≈ 3–9, trailing edge) -------------------------------
+    # --- Flaps (inner wing trailing edge, X ≈ 4–10) ------------------
+    # Trailing edge sweep ≈ 6° in this region.
+    # Wing Z: ≈ -0.55 @X=6, ≈ -0.10 @X=10
     for side_sign in (-1, 1):
         side = 'right' if side_sign > 0 else 'left'
         chord = 1.0
         pivot = NodePath(f'flap_{side}')
-        pivot.setX(side_sign * 6.0)
-        pivot.setY(-0.35 + chord / 2)       # forward (hinge) edge
-        pivot.setZ(-2.73)                    # wing surface at X=6
-        pivot.setH(side_sign * -5)           # slight inboard sweep
+        pivot.setX(side_sign * 7.0)
+        pivot.setY(-0.3 + chord / 2)        # hinge (forward edge)
+        pivot.setZ(-0.35)                    # wing surface Z @X=7
+        pivot.setH(side_sign * -6)           # trailing-edge sweep
         pivot.reparentTo(plane)
         geom = _make_box_geom(5.5, chord, THICKNESS, color=SURFACE_COLOR)
         geom.setY(-chord / 2)
         geom.reparentTo(pivot)
 
-    # --- Spoilers (on top of wing) ------------------------------------
-    # Pivot at forward/bottom edge on the wing top surface.
+    # --- Spoilers (on wing top surface) -------------------------------
     for side_sign in (-1, 1):
         side = 'right' if side_sign > 0 else 'left'
-        chord = 1.2
+        chord = 1.0
 
-        # Inner spoiler at X ≈ 8
+        # Inner spoiler @X ≈ 7 (wing top Z ≈ -0.23)
         pivot1 = NodePath(f'spoiler_{side}_1')
-        pivot1.setX(side_sign * 8.0)
-        pivot1.setY(1.55 + chord / 2)       # forward edge
-        pivot1.setZ(-2.57)                   # wing top surface
-        pivot1.setH(side_sign * -10)
+        pivot1.setX(side_sign * 7.0)
+        pivot1.setY(0.8)
+        pivot1.setZ(-0.20)
+        pivot1.setH(side_sign * -6)
         pivot1.reparentTo(plane)
         geom1 = _make_box_geom(3.0, chord, THICKNESS, color=SURFACE_COLOR)
         geom1.setY(-chord / 2)
-        geom1.setZ(THICKNESS / 2)           # bottom edge at pivot Z
+        geom1.setZ(THICKNESS / 2)
         geom1.reparentTo(pivot1)
 
-        # Outer spoiler at X ≈ 12
+        # Outer spoiler @X ≈ 11 (wing top Z ≈ 0.13)
         pivot2 = NodePath(f'spoiler_{side}_2')
-        pivot2.setX(side_sign * 12.0)
-        pivot2.setY(-0.17 + chord / 2)      # forward edge
-        pivot2.setZ(-2.23)                   # wing top surface
-        pivot2.setH(side_sign * -17)
+        pivot2.setX(side_sign * 11.0)
+        pivot2.setY(-0.5)
+        pivot2.setZ(0.10)
+        pivot2.setH(side_sign * -15)
         pivot2.reparentTo(plane)
         geom2 = _make_box_geom(3.0, chord, THICKNESS, color=SURFACE_COLOR)
         geom2.setY(-chord / 2)
@@ -352,25 +354,27 @@ def _add_animated_surfaces(plane):
         geom2.reparentTo(pivot2)
 
     # --- Rudder (aft edge of vertical fin) ----------------------------
-    # Hinge at forward edge where fin meets rudder.
+    # Fin trailing edge Y ≈ -17.8 @Z=2, Y ≈ -18.3 @Z=8
+    # Fin mid-height Z ≈ 4.5
     chord_r = 1.2
     pivot_r = NodePath('rudder')
-    pivot_r.setY(-17.5 + chord_r / 2)       # forward (hinge) edge
-    pivot_r.setZ(2.2)                        # fin mid-height
+    pivot_r.setY(-17.0)                      # hinge (forward edge)
+    pivot_r.setZ(4.5)                        # fin mid-height
     pivot_r.reparentTo(plane)
-    geom_r = _make_box_geom(0.25, chord_r, 5.0, color=SURFACE_COLOR)
-    geom_r.setY(-chord_r / 2)               # box extends aft from hinge
+    geom_r = _make_box_geom(0.25, chord_r, 5.5, color=SURFACE_COLOR)
+    geom_r.setY(-chord_r / 2)
     geom_r.reparentTo(pivot_r)
 
     # --- Elevators (trailing edge of horizontal stab) -----------------
+    # Stab trailing edge: Y ≈ -18.1 @X=±6, Z ≈ 1.3
     for side_sign in (-1, 1):
         side = 'right' if side_sign > 0 else 'left'
         chord_e = 0.8
         pivot_e = NodePath(f'elevator_{side}')
-        pivot_e.setX(side_sign * 4.0)
-        pivot_e.setY(-18.0 + chord_e / 2)   # forward (hinge) edge
-        pivot_e.setZ(-1.15)                  # stab surface level
-        pivot_e.setH(side_sign * -5)         # slight sweep
+        pivot_e.setX(side_sign * 3.5)
+        pivot_e.setY(-17.2 + chord_e / 2)   # hinge
+        pivot_e.setZ(1.3)                    # stab surface level
+        pivot_e.setH(side_sign * -5)
         pivot_e.reparentTo(plane)
         geom_e = _make_box_geom(5.0, chord_e, THICKNESS, color=SURFACE_COLOR)
         geom_e.setY(-chord_e / 2)
@@ -396,18 +400,18 @@ def _add_aircraft_lights(plane, hd=True):
 
     # Position tables — HD glb vs procedural fallback geometry
     if hd:
-        nav_l   = (-17.0, -3.5, -1.5)
-        nav_r   = ( 17.0, -3.5, -1.5)
-        nav_t   = (  0.0, -18.8,  0.5)
-        stb_l   = (-16.5, -4.2, -1.5)
-        stb_r   = ( 16.5, -4.2, -1.5)
-        stb_t   = (  0.0, -19.0, -0.5)
-        bcn_top = (  0.0,  -1.0,  2.2)
-        bcn_bot = (  0.0,  -1.0, -4.5)
-        ldg_l   = ( -3.5,   3.0, -3.2)
-        ldg_r   = (  3.5,   3.0, -3.2)
-        logo_l  = ( -2.5, -16.0, -0.8)
-        logo_r  = (  2.5, -16.0, -0.8)
+        nav_l   = (-17.0, -3.6,  0.76)
+        nav_r   = ( 17.0, -3.6,  0.76)
+        nav_t   = (  0.0, -18.8,  1.0)
+        stb_l   = (-16.5, -3.4,  0.50)
+        stb_r   = ( 16.5, -3.4,  0.50)
+        stb_t   = (  0.0, -18.5,  1.0)
+        bcn_top = (  0.0,  -1.0,  1.7)
+        bcn_bot = (  0.0,  -1.0, -2.4)
+        ldg_l   = ( -5.5,   5.5, -1.5)
+        ldg_r   = (  5.5,   5.5, -1.5)
+        logo_l  = ( -2.5, -16.0,  1.0)
+        logo_r  = (  2.5, -16.0,  1.0)
     else:
         nav_l   = (-17.0, -3.5, -0.8)
         nav_r   = ( 17.0, -3.5, -0.8)
@@ -467,19 +471,18 @@ def _add_aircraft_lights(plane, hd=True):
     turnoff.reparentTo(lights)
     for sign in (-1, 1):
         tl = _make_glow(color=(1.0, 1.0, 0.95, 1), size=0.7)
-        x = sign * (4.5 if hd else 4.0)
-        y = 2.5 if hd else 1.5
-        z = -3.4 if hd else -1.6
+        x = sign * (4.0 if hd else 4.0)
+        y = 4.0 if hd else 1.5
+        z = -1.0 if hd else -1.6
         tl.setPos(x, y, z)
         tl.reparentTo(turnoff)
 
-    # --- Taxi / takeoff light (mounted on nose gear strut) -------------
-    gear_nose = plane.find('**/gear_nose')
-    if not gear_nose.isEmpty():
-        taxi = _make_glow(color=(1.0, 1.0, 0.95, 1), size=1.0)
-        taxi.setName('taxi_light')
-        taxi.setPos(0, 0.5, -0.7)
-        taxi.reparentTo(gear_nose)
+    # --- Taxi / takeoff light -----------------------------------------
+    taxi = NodePath('taxi_light')
+    taxi.reparentTo(lights)
+    tl = _make_glow(color=(1.0, 1.0, 0.95, 1), size=1.0)
+    tl.setPos(0, 13.5, -3.5)                # nose gear area
+    tl.reparentTo(taxi)
 
     # --- Logo lights (on horizontal stab, illuminate fin) --------------
     logo = NodePath('logo_lights')
@@ -493,14 +496,15 @@ def _add_aircraft_lights(plane, hd=True):
 def build_a320():
     """
     Returns a NodePath rooted at the aircraft body centre.
-    Uses a320_hd.glb for the body when available, with procedural animated
-    surfaces added on top.  Falls back to fully procedural geometry.
-    In Panda3D convention: +Y = forward (nose), +X = right wing, +Z = up.
+    Uses a320_cockpit_2.glb when available (includes cockpit interior and
+    static landing gear).  Procedural animated surfaces overlay the model.
+    Falls back to fully procedural geometry if the glb is missing.
+
     Named sub-nodes for animation:
-      .find('**/gear_nose'), .find('**/gear_left'), .find('**/gear_right')
       .find('**/aileron_left'), .find('**/aileron_right')
-      .find('**/elevator_left'), .find('**/elevator_right'),
+      .find('**/elevator_left'), .find('**/elevator_right')
       .find('**/rudder'), .find('**/flap_left'), .find('**/flap_right')
+      .find('**/spoiler_left_1'), .find('**/spoiler_right_1'), etc.
     """
 
     # ------------------------------------------------------------------
@@ -514,24 +518,8 @@ def build_a320():
         _add_animated_surfaces(plane)
         _add_aircraft_lights(plane, hd=True)
 
-        # Gear bay fairings — dark recesses on the belly so gear
-        # struts look connected to the fuselage, not floating.
-        nose_bay = _make_box_geom(1.2, 2.0, 0.3, color=GEAR_BAY_COLOR)
-        nose_bay.setPos(0, 14.0, -4.5)
-        nose_bay.reparentTo(plane)
-
-        for bay_sign in (-1, 1):
-            main_bay = _make_box_geom(1.8, 2.4, 0.3, color=GEAR_BAY_COLOR)
-            main_bay.setPos(bay_sign * 3.5, -1.0, -4.5)
-            main_bay.reparentTo(plane)
-
-        # Landing gear — fuselage belly is at Z ≈ -4.55
-        _build_gear('gear_nose',  0.0,  14.0, -4.5, leg_len=2.2
-                    ).reparentTo(plane)
-        _build_gear('gear_left', -3.5,  -1.0, -4.5, leg_len=2.2, main=True
-                    ).reparentTo(plane)
-        _build_gear('gear_right', 3.5,  -1.0, -4.5, leg_len=2.2, main=True
-                    ).reparentTo(plane)
+        # The GLB model includes detailed static landing gear geometry,
+        # so no procedural gear or gear bay fairings are added.
 
         return plane
 

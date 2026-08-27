@@ -72,6 +72,15 @@ class HUD:
             scale=0.032,
         )
 
+        # Collect all elements for bulk show/hide
+        self.all_elements = [
+            self.left_panel, self.right_panel,
+            self.spd, self.alt, self.hdg, self.vs, self.gs,
+            self.n1, self.thr, self.flaps, self.gear, self.brk, self.spbrk,
+            self.cam_mode, self.phase, self.ra, self.gear_warn,
+            self.ctrl, self.yoke, self.help,
+        ]
+
     def _make(self, x, y, text, align='left', scale=0.045):
         a = TextNode.ALeft
         if align == 'right':  a = TextNode.ARight
@@ -81,6 +90,14 @@ class HUD:
             align=a, mayChange=True, shadow=(0, 0, 0, 0.7),
             shadowOffset=(0.06, 0.06),
         )
+
+    def show(self):
+        for el in self.all_elements:
+            el.show()
+
+    def hide(self):
+        for el in self.all_elements:
+            el.hide()
 
     @staticmethod
     def _detect_phase(fd):

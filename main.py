@@ -366,6 +366,7 @@ class Sim(ShowBase):
             'TOWER': 'tower', 'TOP DOWN': 'topdown',
         }
         self.camera_mode = cam_map.get(self.camera_menu.get(), 'chase')
+        self._sync_cockpit_visibility()
         if self.graphics_menu.get() == 'PERFORMANCE':
             self.render.clearAntialias()
             self.render.getFog().setLinearRange(1200, 18000)
@@ -504,20 +505,28 @@ class Sim(ShowBase):
             self.cam_pan_yaw_deg = 0.0
             self.cam_pan_pitch_deg = 0.0
             self._cam_lookat_pos = None
+            self._sync_cockpit_visibility()
         elif k == 'f2':
             self.camera_mode = 'cockpit'
+            self._sync_cockpit_visibility()
         elif k == 'f3':
             self.camera_mode = 'pax_left'
+            self._sync_cockpit_visibility()
         elif k == 'f4':
             self.camera_mode = 'pax_right'
+            self._sync_cockpit_visibility()
         elif k == 'f5':
             self.camera_mode = 'gear'
+            self._sync_cockpit_visibility()
         elif k == 'f6':
             self.camera_mode = 'tail'
+            self._sync_cockpit_visibility()
         elif k == 'f7':
             self.camera_mode = 'tower'
+            self._sync_cockpit_visibility()
         elif k == 'f8':
             self.camera_mode = 'topdown'
+            self._sync_cockpit_visibility()
         elif k == 'c':
             idx = CAMERA_VIEWS.index(self.camera_mode) if self.camera_mode in CAMERA_VIEWS else -1
             self.camera_mode = CAMERA_VIEWS[(idx + 1) % len(CAMERA_VIEWS)]
@@ -525,8 +534,16 @@ class Sim(ShowBase):
                 self.cam_pan_yaw_deg = 0.0
                 self.cam_pan_pitch_deg = 0.0
                 self._cam_lookat_pos = None
+            self._sync_cockpit_visibility()
         elif k == 'r' and not was_down:
             self.fd.reverser = not self.fd.reverser
+
+    def _sync_cockpit_visibility(self):
+        """Show/hide HUD based on current camera mode."""
+        if self.camera_mode == 'cockpit':
+            self.hud.hide()
+        else:
+            self.hud.show()
 
     def _key_up(self, k):
         self.keys[k] = False
@@ -800,11 +817,12 @@ class Sim(ShowBase):
             self.camera.lookAt(self._cam_lookat_pos)
 
         elif self.camera_mode == 'cockpit':
-            # Fixed forward with g-force shake
-            fwd_offset = self.plane.getQuat().xform(Vec3(0, 16.5, 2.5))
-            motion = self.plane.getQuat().xform(self.camera_motion)
+            # Captain's seat — inside the 3D cockpit model
+            # Dampen shake to ~25% — cockpit is rigid, pilot's head is braced
+            fwd_offset = self.plane.getQuat().xform(Vec3(-0.3, 15.5, 0.76))
+            motion = self.plane.getQuat().xform(self.camera_motion * 0.25)
             self.camera.setPos(self.plane.getPos() + fwd_offset + motion)
-            self.camera.setHpr(self.plane.getHpr() + self.camera_motion_hpr)
+            self.camera.setHpr(self.plane.getHpr() + self.camera_motion_hpr * 0.25)
             self.camera.setP(self.camera.getP() - 3)
 
         elif self.camera_mode == 'pax_left':
