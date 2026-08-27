@@ -18,6 +18,7 @@ import os
 from panda3d.core import (
     Geom, GeomNode, GeomVertexData, GeomVertexFormat, GeomVertexWriter,
     GeomTriangles, NodePath, Vec3, Vec4, Point3, LVector3,
+    ColorBlendAttrib, TransparencyAttrib,
 )
 import math
 
@@ -149,6 +150,63 @@ def _make_cylinder_geom(radius, length, segments=16, color=(1, 1, 1, 1),
     node = GeomNode('cyl')
     node.addGeom(geom)
     return NodePath(node)
+
+
+def _make_glow(color=(1, 1, 1, 1), size=0.5):
+    """Billboard glow disc for aircraft lights — three-layer radial fade.
+
+    Uses additive blending so glows look bright against dark backgrounds
+    and blend naturally in daylight.  Always faces the camera.
+    """
+    r, g, b, _ = color
+    segments = 12
+    layers = [
+        (size * 0.25, (r, g, b, 1.0)),        # bright core
+        (size * 0.65, (r, g, b, 0.55)),        # mid halo
+        (size * 1.40, (r, g, b, 0.18)),        # soft bloom
+    ]
+
+    fmt = GeomVertexFormat.getV3n3c4()
+    vdata = GeomVertexData('glow', fmt, Geom.UHStatic)
+    vwr = GeomVertexWriter(vdata, 'vertex')
+    nwr = GeomVertexWriter(vdata, 'normal')
+    cwr = GeomVertexWriter(vdata, 'color')
+    tris = GeomTriangles(Geom.UHStatic)
+
+    idx = 0
+    for radius, col in layers:
+        # Center vertex — full layer colour
+        vwr.addData3(0, 0, 0)
+        nwr.addData3(0, 1, 0)
+        cwr.addData4(*col)
+        center = idx
+        idx += 1
+        # Ring vertices — transparent at the rim for radial fade
+        for i in range(segments):
+            a = 2 * math.pi * i / segments
+            vwr.addData3(math.cos(a) * radius, 0, math.sin(a) * radius)
+            nwr.addData3(0, 1, 0)
+            cwr.addData4(col[0], col[1], col[2], 0.0)
+            idx += 1
+        for i in range(segments):
+            tris.addVertices(center, center + 1 + i,
+                             center + 1 + (i + 1) % segments)
+
+    geom = Geom(vdata)
+    geom.addPrimitive(tris)
+    gn = GeomNode('glow')
+    gn.addGeom(geom)
+    np = NodePath(gn)
+    np.setLightOff()
+    np.setDepthWrite(False)
+    np.setTransparency(TransparencyAttrib.MAlpha)
+    np.setAttrib(ColorBlendAttrib.make(
+        ColorBlendAttrib.MAdd,
+        ColorBlendAttrib.OIncomingAlpha,
+        ColorBlendAttrib.OOne))
+    np.setBin('transparent', 22)
+    np.setBillboardPointEye()
+    return np
 
 
 # ----------------------------------------------------------------------
@@ -319,6 +377,119 @@ def _add_animated_surfaces(plane):
         geom_e.reparentTo(pivot_e)
 
 
+def _add_aircraft_lights(plane, hd=True):
+    """Add A320 exterior lights matching real positions.
+
+    Light types and their behaviour (animated by main.py):
+        nav lights   — always on (red port, green starboard, white tail)
+        strobes      — flashing white (wingtips + tail)
+        beacons      — flashing red (top + bottom fuselage)
+        landing      — bright white at wing root (on when gear down)
+        taxi         — white on nose gear strut (on when on ground)
+        logo         — white on horizontal stab (always on)
+
+    Group NodePaths are named so main.py can find them and control
+    brightness via ``setColorScale()``.
+    """
+    lights = NodePath('aircraft_lights')
+    lights.reparentTo(plane)
+
+    # Position tables — HD glb vs procedural fallback geometry
+    if hd:
+        nav_l   = (-17.0, -3.5, -1.5)
+        nav_r   = ( 17.0, -3.5, -1.5)
+        nav_t   = (  0.0, -18.8,  0.5)
+        stb_l   = (-16.5, -4.2, -1.5)
+        stb_r   = ( 16.5, -4.2, -1.5)
+        stb_t   = (  0.0, -19.0, -0.5)
+        bcn_top = (  0.0,  -1.0,  2.2)
+        bcn_bot = (  0.0,  -1.0, -4.5)
+        ldg_l   = ( -3.5,   3.0, -3.2)
+        ldg_r   = (  3.5,   3.0, -3.2)
+        logo_l  = ( -2.5, -16.0, -0.8)
+        logo_r  = (  2.5, -16.0, -0.8)
+    else:
+        nav_l   = (-17.0, -3.5, -0.8)
+        nav_r   = ( 17.0, -3.5, -0.8)
+        nav_t   = (  0.0, -18.0,  3.5)
+        stb_l   = (-16.5, -4.0, -0.8)
+        stb_r   = ( 16.5, -4.0, -0.8)
+        stb_t   = (  0.0, -18.5,  0.5)
+        bcn_top = (  0.0,  -1.0,  2.2)
+        bcn_bot = (  0.0,  -1.0, -2.0)
+        ldg_l   = ( -3.0,   2.0, -1.5)
+        ldg_r   = (  3.0,   2.0, -1.5)
+        logo_l  = ( -3.0, -16.0,  1.8)
+        logo_r  = (  3.0, -16.0,  1.8)
+
+    # --- Navigation lights (always on) --------------------------------
+    nav_group = NodePath('nav_lights')
+    nav_group.reparentTo(lights)
+
+    nl = _make_glow(color=(1.0, 0.05, 0.05, 1), size=0.4)  # port RED
+    nl.setPos(*nav_l)
+    nl.reparentTo(nav_group)
+
+    nr = _make_glow(color=(0.05, 1.0, 0.05, 1), size=0.4)  # starboard GREEN
+    nr.setPos(*nav_r)
+    nr.reparentTo(nav_group)
+
+    nt = _make_glow(color=(1.0, 1.0, 1.0, 1), size=0.3)    # tail WHITE
+    nt.setPos(*nav_t)
+    nt.reparentTo(nav_group)
+
+    # --- Strobe lights (flashing white — Airbus double-flash) ---------
+    strobes = NodePath('strobes')
+    strobes.reparentTo(lights)
+    for pos in (stb_l, stb_r, stb_t):
+        s = _make_glow(color=(1.0, 1.0, 1.0, 1), size=0.9)
+        s.setPos(*pos)
+        s.reparentTo(strobes)
+
+    # --- Anti-collision beacons (flashing red) -------------------------
+    beacons = NodePath('beacons')
+    beacons.reparentTo(lights)
+    for pos in (bcn_top, bcn_bot):
+        b = _make_glow(color=(1.0, 0.08, 0.02, 1), size=0.6)
+        b.setPos(*pos)
+        b.reparentTo(beacons)
+
+    # --- Landing lights (bright white, wing root) ----------------------
+    landing = NodePath('landing_lights')
+    landing.reparentTo(lights)
+    for pos in (ldg_l, ldg_r):
+        ll = _make_glow(color=(1.0, 1.0, 0.95, 1), size=1.5)
+        ll.setPos(*pos)
+        ll.reparentTo(landing)
+
+    # --- Runway turnoff lights (angled laterally from wing root) -------
+    turnoff = NodePath('turnoff_lights')
+    turnoff.reparentTo(lights)
+    for sign in (-1, 1):
+        tl = _make_glow(color=(1.0, 1.0, 0.95, 1), size=0.7)
+        x = sign * (4.5 if hd else 4.0)
+        y = 2.5 if hd else 1.5
+        z = -3.4 if hd else -1.6
+        tl.setPos(x, y, z)
+        tl.reparentTo(turnoff)
+
+    # --- Taxi / takeoff light (mounted on nose gear strut) -------------
+    gear_nose = plane.find('**/gear_nose')
+    if not gear_nose.isEmpty():
+        taxi = _make_glow(color=(1.0, 1.0, 0.95, 1), size=1.0)
+        taxi.setName('taxi_light')
+        taxi.setPos(0, 0.5, -0.7)
+        taxi.reparentTo(gear_nose)
+
+    # --- Logo lights (on horizontal stab, illuminate fin) --------------
+    logo = NodePath('logo_lights')
+    logo.reparentTo(lights)
+    for pos in (logo_l, logo_r):
+        lo = _make_glow(color=(1.0, 1.0, 0.90, 1), size=0.35)
+        lo.setPos(*pos)
+        lo.reparentTo(logo)
+
+
 def build_a320():
     """
     Returns a NodePath rooted at the aircraft body centre.
@@ -341,6 +512,7 @@ def build_a320():
         glb.reparentTo(plane)
 
         _add_animated_surfaces(plane)
+        _add_aircraft_lights(plane, hd=True)
 
         # Gear bay fairings — dark recesses on the belly so gear
         # struts look connected to the fuselage, not floating.
@@ -507,5 +679,7 @@ def build_a320():
             window.setZ(z)
             window.setH(side_sign * -12)
             window.reparentTo(plane)
+
+    _add_aircraft_lights(plane, hd=False)
 
     return plane

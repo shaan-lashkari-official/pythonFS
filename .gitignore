@@ -1,7 +1,9 @@
 .venv312/
 .venv/
 __pycache__/
+.claude/
 *.pyc
 osm_processed.pkl
 osm_raw_cache/
-audio_cache/
+PLAN.md
+README.md

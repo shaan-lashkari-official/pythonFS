@@ -178,6 +178,14 @@ class Sim(ShowBase):
         self.n_gear_l    = self.plane.find('**/gear_left')
         self.n_gear_r    = self.plane.find('**/gear_right')
 
+        # Aircraft exterior light groups (for animation)
+        self.n_strobes        = self.plane.find('**/strobes')
+        self.n_beacons        = self.plane.find('**/beacons')
+        self.n_landing_lights = self.plane.find('**/landing_lights')
+        self.n_turnoff_lights = self.plane.find('**/turnoff_lights')
+        self.n_taxi_light     = self.plane.find('**/taxi_light')
+        self.n_logo_lights    = self.plane.find('**/logo_lights')
+
         # --- Physics
         self.fd = FlightDynamics(dt=PHYSICS_DT)
         self.sim_started = False
@@ -685,6 +693,45 @@ class Sim(ShowBase):
             # Right main gear folds inward (negative roll)
             self.n_gear_r.setR((1.0 - gear_pos) * -90)
 
+    def _animate_lights(self):
+        """Flash strobes and beacons, toggle landing/taxi/logo lights."""
+        t = globalClock.getRealTime()
+
+        # Strobe: Airbus-style double flash, ~1.09 s cycle.
+        # Two quick 50ms flashes separated by a 50ms gap, then dark.
+        phase = t % 1.09
+        strobe_on = 1.0 if (phase < 0.05 or 0.10 < phase < 0.15) else 0.0
+        if not self.n_strobes.isEmpty():
+            self.n_strobes.setColorScale(strobe_on, strobe_on,
+                                         strobe_on, 1)
+
+        # Beacon: smooth red pulse ~55 flashes/min (0.917 Hz).
+        # Cube-power gives a sharper flash-then-dark shape.
+        beacon_v = max(0.0, math.sin(t * 2.0 * math.pi * 0.917)) ** 3
+        if not self.n_beacons.isEmpty():
+            self.n_beacons.setColorScale(beacon_v, beacon_v,
+                                         beacon_v, 1)
+
+        # Landing lights: on when gear mostly extended
+        gear_pos = self.fd.gear_position_norm()
+        ldg = 1.0 if gear_pos > 0.5 else 0.0
+        if not self.n_landing_lights.isEmpty():
+            self.n_landing_lights.setColorScale(ldg, ldg, ldg, 1)
+
+        # Runway turnoff lights: on when on ground with gear down
+        ground_on = 1.0 if (self.fd.on_ground() and gear_pos > 0.8) else 0.0
+        if not self.n_turnoff_lights.isEmpty():
+            self.n_turnoff_lights.setColorScale(ground_on, ground_on,
+                                                ground_on, 1)
+
+        # Taxi / takeoff light: on when on ground with gear down
+        if not self.n_taxi_light.isEmpty():
+            self.n_taxi_light.setColorScale(ground_on, ground_on,
+                                            ground_on, 1)
+
+        # Logo lights: always on (real A320 auto-on with gear/flaps)
+        # No animation needed — they stay lit.
+
     def _update_camera(self,dt):
         forward_g, lateral_g, vertical_g = self.fd.body_acceleration_g()
         vertical_g -= 1.0
@@ -882,6 +929,7 @@ class Sim(ShowBase):
 
         self._sync_plane_to_physics()
         self._animate_surfaces()
+        self._animate_lights()
         self._update_camera(dt)
         self.audio.update(self.fd)
         update_dynamic_night_lights(self.night_pool, self.plane.getPos())
